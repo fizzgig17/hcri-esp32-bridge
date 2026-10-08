@@ -393,7 +393,7 @@ static void draw_battery() {
     fill(BATT_X, 3, BATT_W, 16, BLACK);
     if (batt.pct < 0) return;
     uint16_t col = batt.pct < 15 && !batt.plugged ? RED : WHITE;
-    char b[8];
+    char b[16];
     snprintf(b, sizeof b, "%d%%", batt.pct);
     int w = (int)strlen(b) * 12;
     int x = BATT_X + BATT_W - w;                      // right-aligned
