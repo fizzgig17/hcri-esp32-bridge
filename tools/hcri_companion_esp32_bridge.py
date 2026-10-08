@@ -5,13 +5,15 @@ hCRI Companion ESP32 Bridge -- find the ESP32 on USB, show what it is, download 
     python hcri_companion_esp32_bridge.py            (Windows: py hcri_companion_esp32_bridge.py)
     python hcri_companion_esp32_bridge.py --prod     skip the question: production build only
     python hcri_companion_esp32_bridge.py --dev      skip the question: development build
+    python hcri_companion_esp32_bridge.py --no-probe skip identifying the board (you pick the firmware)
 
 Needs Python 3.8+ and esptool (the script installs it with pip if it is missing).
 No other setup: it downloads the firmware from this repo's GitHub releases.
 
 What it can and can't detect: the chip (ESP32-S3), flash size and PSRAM come from the board
 itself, but a plain T-Display S3 and a T-Display-S3 Pro look identical to esptool, so the
-script asks which board you have (and remembers the answer for next time).
+script flashes a tiny probe program to find out (the Pro has a power chip on I2C that the
+plain board lacks) and remembers each board by its MAC address.
 """
 import hashlib
 import json
@@ -33,11 +35,20 @@ FIRMWARE = [
     ("Battery-life tester - T-Display-S3 Pro (older V1.0 board)", "battery-test-pro-v1_0.bin"),
 ]
 # Which release tag(s) hold each asset, in the order they are tried.
+PROBE_ASSET = "board-probe.bin"
+PROBE_TAG = "board-probe-latest"
+BOARD_NAMES = {"pro": "LilyGo T-Display-S3 Pro", "s3": "LilyGo T-Display S3"}
+# Which FIRMWARE entries (by asset name) make sense on each board.
+FOR_BOARD = {
+    "pro": ["hcri-esp32-bridge-pro-factory.bin", "battery-test-pro-v1_1.bin", "battery-test-pro-v1_0.bin"],
+    "s3": ["hcri-esp32-bridge-factory.bin"],
+}
 TAGS = {
     "hcri-esp32-bridge-factory.bin": {"stable": "prod-latest", "dev": "dev-latest"},
     "hcri-esp32-bridge-pro-factory.bin": {"stable": "prod-latest", "dev": "dev-latest"},
     "battery-test-pro-v1_1.bin": {"stable": "battery-test-pro-latest", "dev": "battery-test-pro-latest"},
     "battery-test-pro-v1_0.bin": {"stable": "battery-test-pro-latest", "dev": "battery-test-pro-latest"},
+    PROBE_ASSET: {"stable": PROBE_TAG, "dev": PROBE_TAG},
 }
 
 
@@ -204,6 +215,77 @@ def fetch_firmware(asset_name, channel):
     return dest
 
 
+def parse_probe_line(line):
+    """'HCRI-PROBE board=pro pmu=1 ...' -> 'pro' / 'not-pro', or None if it isn't a probe line."""
+    if "HCRI-PROBE" not in line:
+        return None
+    for tok in line.split():
+        if tok.startswith("board="):
+            return tok[len("board="):]
+    return None
+
+
+def read_probe_answer(timeout_s=30):
+    """After the probe program starts, listen on the board's serial port(s) for its answer.
+    The port can disappear and come back (possibly under a new COM number) while the board resets."""
+    import time
+    import serial
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        for p in find_ports():
+            try:
+                ser = serial.Serial()
+                ser.port = p.device
+                ser.baudrate = 115200
+                ser.timeout = 1
+                ser.dtr = False   # opening the port must not reset the board
+                ser.rts = False
+                ser.open()
+            except Exception:
+                continue
+            try:
+                end = time.time() + 5
+                while time.time() < end:
+                    line = ser.readline().decode("utf-8", "replace")
+                    answer = parse_probe_line(line)
+                    if answer:
+                        return answer
+            except Exception:
+                pass
+            finally:
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+        time.sleep(1)
+    return None
+
+
+def identify_board(port, channel_unused=None):
+    """Flash the tiny probe program, read what it says. Returns 'pro', 's3' or None."""
+    print("Flashing a tiny test program to find out which board this is (it doesn't touch the screen)...")
+    try:
+        path = fetch_firmware(PROBE_ASSET, "stable")
+    except (urllib.error.URLError, OSError) as e:
+        print("Couldn't download the test program: %s" % e)
+        return None
+    if not path:
+        print("The test program isn't published yet.")
+        return None
+    rc, _ = run_esptool(["--chip", "esp32s3", "--port", port, "--baud", "460800", "write_flash", "0x0", path])
+    if rc != 0:
+        print("Couldn't flash the test program.")
+        return None
+    print("Listening for the board's answer...")
+    ans = read_probe_answer()
+    if ans == "pro":
+        return "pro"
+    if ans == "not-pro":
+        return "s3"
+    print("The board didn't answer.")
+    return None
+
+
 def pick(title, options, default_index=0):
     print()
     print(title)
@@ -247,11 +329,41 @@ def main():
     if "ESP32-S3" not in info.get("chip", ""):
         print("\nThis is not an ESP32-S3, so none of the hCRI firmware fits it. Nothing was changed.")
         return 1
-    print("\nNote: a T-Display S3 and a T-Display-S3 Pro look the same to the chip, so please pick the board.")
+    mac = info.get("mac", "")
+    boards = st.setdefault("boards", {})
+    kind = boards.get(mac)
+    if kind in BOARD_NAMES:
+        print("\nThis board was identified before: %s." % BOARD_NAMES[kind])
+    elif "--no-probe" not in sys.argv:
+        print("\nA T-Display S3 and a T-Display-S3 Pro look the same to the chip, so the program can")
+        print("identify the board by running a tiny test program on it first.")
+        if ask("Identify the board now? [Y/n] ", "y").lower().startswith("y"):
+            kind = identify_board(port)
+            if kind:
+                print("\nResult: %s." % BOARD_NAMES[kind])
+                if ask("Is that right? [Y/n] ", "y").lower().startswith("y"):
+                    boards[mac] = kind
+                    save_state(st)
+                else:
+                    kind = None
+            if not kind:
+                print("OK, you'll choose the firmware yourself.")
+            # the probe left the port in use / board running: find it again for flashing
+            ports = find_ports()
+            if ports and all(p.device != port for p in ports):
+                port = ports[0].device
+                print("(The board is now on %s.)" % port)
 
-    default = FIRMWARE_NAMES.index(st["last"]) if st.get("last") in FIRMWARE_NAMES else 0
-    idx = pick("What do you want to put on it?", [t for t, _ in FIRMWARE], default)
-    text, asset_name = FIRMWARE[idx]
+    choices = [fw for fw in FIRMWARE if kind is None or fw[1] in FOR_BOARD[kind]]
+    default = 0
+    if st.get("last") in [n for _, n in choices]:
+        default = [n for _, n in choices].index(st["last"])
+    if len(choices) == 1:
+        text, asset_name = choices[0]
+        print("\nFirmware for this board: %s" % text)
+    else:
+        idx = pick("What do you want to put on it?", [t for t, _ in choices], default)
+        text, asset_name = choices[idx]
     if "--dev" in sys.argv:
         channel = "dev"
     elif "--prod" in sys.argv:
