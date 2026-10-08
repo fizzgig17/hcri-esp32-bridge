@@ -1,0 +1,422 @@
+#!/usr/bin/env python3
+"""
+hCRI Companion ESP32 Bridge -- find the ESP32 on USB, show what it is, download the right firmware and flash it.
+
+    python hcri_companion_esp32_bridge.py            (Windows: py hcri_companion_esp32_bridge.py)
+    python hcri_companion_esp32_bridge.py --prod     skip the question: production build only
+    python hcri_companion_esp32_bridge.py --dev      skip the question: development build
+    python hcri_companion_esp32_bridge.py --no-probe skip identifying the board (you pick the firmware)
+
+Needs Python 3.8+ and esptool (the script installs it with pip if it is missing).
+No other setup: it downloads the firmware from this repo's GitHub releases.
+
+What it can and can't detect: the chip (ESP32-S3), flash size and PSRAM come from the board
+itself, but a plain T-Display S3 and a T-Display-S3 Pro look identical to esptool, so the
+script flashes a tiny probe program to find out (the Pro has a power chip on I2C that the
+plain board lacks) and remembers each board by its MAC address.
+"""
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+
+REPO = "fizzgig17/hcri-esp32-bridge"
+STATE_FILE = os.path.join(os.path.expanduser("~"), ".hcri-companion-esp32-bridge.json")
+
+# (menu text, release asset name, boards it applies to)
+FIRMWARE = [
+    ("Torch Bearer bridge - T-Display S3", "hcri-esp32-bridge-factory.bin"),
+    ("Torch Bearer bridge - T-Display-S3 Pro", "hcri-esp32-bridge-pro-factory.bin"),
+    ("Battery-life tester - T-Display-S3 Pro (V1.1 board)", "battery-test-pro-v1_1.bin"),
+    ("Battery-life tester - T-Display-S3 Pro (older V1.0 board)", "battery-test-pro-v1_0.bin"),
+]
+# Which release tag(s) hold each asset, in the order they are tried.
+PROBE_ASSET = "board-probe.bin"
+PROBE_TAG = "board-probe-latest"
+BOARD_NAMES = {"pro": "LilyGo T-Display-S3 Pro", "s3": "LilyGo T-Display S3"}
+# Which FIRMWARE entries (by asset name) make sense on each board.
+FOR_BOARD = {
+    "pro": ["hcri-esp32-bridge-pro-factory.bin", "battery-test-pro-v1_1.bin", "battery-test-pro-v1_0.bin"],
+    "s3": ["hcri-esp32-bridge-factory.bin"],
+}
+TAGS = {
+    "hcri-esp32-bridge-factory.bin": {"stable": "prod-latest", "dev": "dev-latest"},
+    "hcri-esp32-bridge-pro-factory.bin": {"stable": "prod-latest", "dev": "dev-latest"},
+    "battery-test-pro-v1_1.bin": {"stable": "battery-test-pro-latest", "dev": "battery-test-pro-latest"},
+    "battery-test-pro-v1_0.bin": {"stable": "battery-test-pro-latest", "dev": "battery-test-pro-latest"},
+    PROBE_ASSET: {"stable": PROBE_TAG, "dev": PROBE_TAG},
+}
+
+
+def ensure_esptool():
+    try:
+        import esptool  # noqa: F401
+    except ImportError:
+        print("Installing esptool (one time)...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "esptool"])
+
+
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_state(st):
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(st, f)
+    except Exception:
+        pass
+
+
+def ask(prompt, default=None):
+    try:
+        v = input(prompt).strip()
+    except EOFError:
+        v = ""
+    return v or (default if default is not None else "")
+
+
+def find_ports():
+    """Serial ports that look like an ESP32 (Espressif USB, or common USB-serial chips), best guesses first."""
+    from serial.tools import list_ports
+    found = []
+    for p in list_ports.comports():
+        vid = p.vid or 0
+        if vid == 0x303A:
+            rank = 0   # Espressif's own USB (ESP32-S3 native USB)
+        elif vid in (0x10C4, 0x1A86, 0x0403):
+            rank = 1   # CP210x, CH340, FTDI
+        else:
+            continue
+        found.append((rank, p))
+    found.sort(key=lambda t: (t[0], t[1].device))
+    return [p for _, p in found]
+
+
+def run_esptool(args, capture=False):
+    cmd = [sys.executable, "-m", "esptool"] + args
+    if capture:
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+        return r.returncode, r.stdout
+    return subprocess.call(cmd), ""
+
+
+def probe(port):
+    """Ask the chip what it is. Returns a dict of what we could read, or None if it didn't answer."""
+    rc, out = run_esptool(["--port", port, "--baud", "115200", "flash_id"], capture=True)
+    if rc != 0:
+        return None
+    info = {"raw": out}
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("Chip is "):
+            info["chip"] = line[len("Chip is "):]
+        elif line.startswith("Features:"):
+            info["features"] = line[len("Features:"):].strip()
+        elif line.startswith("MAC:"):
+            info["mac"] = line[4:].strip()
+        elif "flash size" in line.lower() and ":" in line:
+            info["flash"] = line.split(":", 1)[1].strip()
+    return info
+
+
+def http_json(url):
+    req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json", "User-Agent": "hcri-companion-esp32-bridge"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.load(r)
+
+
+LAST_RELEASE = {}
+
+
+def tag_commit(tag):
+    """Commit the release tag points at (short hash), or '?' if it can't be looked up."""
+    try:
+        ref = http_json("https://api.github.com/repos/%s/git/ref/tags/%s" % (REPO, tag))
+        sha = ref["object"]["sha"]
+        if ref["object"].get("type") == "tag":   # annotated tag -> follow to the commit
+            sha = http_json("https://api.github.com/repos/%s/git/tags/%s" % (REPO, sha))["object"]["sha"]
+        try:
+            when = http_json("https://api.github.com/repos/%s/commits/%s" % (REPO, sha))["commit"]["committer"]["date"]
+            when = when[:19].replace("T", " ") + " UTC"
+        except Exception:
+            when = "?"
+        return sha[:7] + " (" + when + ")"
+    except Exception:
+        return "?"
+
+
+def find_asset(tag, name):
+    rel = http_json("https://api.github.com/repos/%s/releases/tags/%s" % (REPO, tag))
+    LAST_RELEASE.clear()
+    LAST_RELEASE.update({"tag": tag, "commit": tag_commit(tag)})
+    sums = None
+    asset = None
+    for a in rel.get("assets", []):
+        if a["name"] == name:
+            asset = a
+        if a["name"].startswith("SHA256SUMS"):
+            sums = (sums or []) + [a]
+    return asset, sums or []
+
+
+def download(url, dest):
+    req = urllib.request.Request(url, headers={"User-Agent": "hcri-companion-esp32-bridge"})
+    with urllib.request.urlopen(req, timeout=120) as r, open(dest, "wb") as f:
+        total = int(r.headers.get("Content-Length") or 0)
+        got = 0
+        while True:
+            chunk = r.read(65536)
+            if not chunk:
+                break
+            f.write(chunk)
+            got += len(chunk)
+            if total:
+                print("\r  %d%%" % (got * 100 // total), end="", flush=True)
+    print()
+
+
+def fetch_firmware(asset_name, channel):
+    tag = TAGS[asset_name][channel]
+    print("Looking for %s in release '%s'..." % (asset_name, tag))
+    asset, sums = find_asset(tag, asset_name)
+    if not asset:
+        return None
+    dest = os.path.join(tempfile.gettempdir(), asset_name)
+    LAST_RELEASE["size"] = asset.get("size", 0)
+    download(asset["browser_download_url"], dest)
+    with open(dest, "rb") as f:
+        digest = hashlib.sha256(f.read()).hexdigest()
+    # Verify against the published checksums when they list this file.
+    for s in sums:
+        sp = dest + "." + s["name"]
+        try:
+            download(s["browser_download_url"], sp)
+            with open(sp) as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 2 and os.path.basename(parts[-1].lstrip("*")) == asset_name:
+                        if parts[0].lower() != digest:
+                            print("Checksum mismatch - not flashing.")
+                            return None
+                        print("Checksum OK.")
+                        return dest
+        except Exception:
+            pass
+    print("(No checksum listed for this file; continuing.)")
+    return dest
+
+
+def parse_probe_line(line):
+    """'HCRI-PROBE board=pro pmu=1 ...' -> 'pro' / 'not-pro', or None if it isn't a probe line."""
+    if "HCRI-PROBE" not in line:
+        return None
+    for tok in line.split():
+        if tok.startswith("board="):
+            return tok[len("board="):]
+    return None
+
+
+def read_probe_answer(timeout_s=30):
+    """After the probe program starts, listen on the board's serial port(s) for its answer.
+    The port can disappear and come back (possibly under a new COM number) while the board resets."""
+    import time
+    import serial
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        for p in find_ports():
+            try:
+                ser = serial.Serial()
+                ser.port = p.device
+                ser.baudrate = 115200
+                ser.timeout = 1
+                ser.dtr = False   # opening the port must not reset the board
+                ser.rts = False
+                ser.open()
+            except Exception:
+                continue
+            try:
+                end = time.time() + 5
+                while time.time() < end:
+                    line = ser.readline().decode("utf-8", "replace")
+                    answer = parse_probe_line(line)
+                    if answer:
+                        return answer
+            except Exception:
+                pass
+            finally:
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+        time.sleep(1)
+    return None
+
+
+def identify_board(port, channel_unused=None):
+    """Flash the tiny probe program, read what it says. Returns 'pro', 's3' or None."""
+    print("Flashing a tiny test program to find out which board this is (it doesn't touch the screen)...")
+    try:
+        path = fetch_firmware(PROBE_ASSET, "stable")
+    except (urllib.error.URLError, OSError) as e:
+        print("Couldn't download the test program: %s" % e)
+        return None
+    if not path:
+        print("The test program isn't published yet.")
+        return None
+    rc, _ = run_esptool(["--chip", "esp32s3", "--port", port, "--baud", "460800", "write_flash", "0x0", path])
+    if rc != 0:
+        print("Couldn't flash the test program.")
+        return None
+    print("Listening for the board's answer...")
+    ans = read_probe_answer()
+    if ans == "pro":
+        return "pro"
+    if ans == "not-pro":
+        return "s3"
+    print("The board didn't answer.")
+    return None
+
+
+def pick(title, options, default_index=0):
+    print()
+    print(title)
+    for i, o in enumerate(options, 1):
+        print("  %d) %s%s" % (i, o, "   [default]" if i - 1 == default_index else ""))
+    while True:
+        v = ask("Choose 1-%d: " % len(options), str(default_index + 1))
+        if v.isdigit() and 1 <= int(v) <= len(options):
+            return int(v) - 1
+        print("Please type a number from the list.")
+
+
+def main():
+    ensure_esptool()
+    st = load_state()
+
+    print("hCRI Companion ESP32 Bridge")
+    print("===========================")
+    ports = find_ports()
+    if not ports:
+        print("\nNo ESP32 found on USB.")
+        print("Plug the board in with a DATA USB-C cable. If it is already plugged in and running the")
+        print("bridge firmware, put it in download mode: hold BOOT, tap RESET, release BOOT. Then run this again.")
+        return 1
+    if len(ports) == 1:
+        port = ports[0].device
+        print("\nFound: %s  (%s)" % (port, ports[0].description))
+    else:
+        i = pick("More than one candidate port:", ["%s  (%s)" % (p.device, p.description) for p in ports])
+        port = ports[i].device
+
+    print("\nAsking the board what it is...")
+    info = probe(port)
+    if not info:
+        print("The board didn't answer. Hold BOOT, tap RESET, release BOOT (download mode) and run this again.")
+        return 1
+    print("  Chip:     %s" % info.get("chip", "?"))
+    print("  Features: %s" % info.get("features", "?"))
+    print("  Flash:    %s" % info.get("flash", "?"))
+    print("  MAC:      %s" % info.get("mac", "?"))
+    if "ESP32-S3" not in info.get("chip", ""):
+        print("\nThis is not an ESP32-S3, so none of the hCRI firmware fits it. Nothing was changed.")
+        return 1
+    mac = info.get("mac", "")
+    boards = st.setdefault("boards", {})
+    kind = boards.get(mac)
+    if kind in BOARD_NAMES:
+        print("\nThis board was identified before: %s." % BOARD_NAMES[kind])
+    elif "--no-probe" not in sys.argv:
+        print("\nA T-Display S3 and a T-Display-S3 Pro look the same to the chip, so the program can")
+        print("identify the board by running a tiny test program on it first.")
+        if ask("Identify the board now? [Y/n] ", "y").lower().startswith("y"):
+            kind = identify_board(port)
+            if kind:
+                print("\nResult: %s." % BOARD_NAMES[kind])
+                if ask("Is that right? [Y/n] ", "y").lower().startswith("y"):
+                    boards[mac] = kind
+                    save_state(st)
+                else:
+                    kind = None
+            if not kind:
+                print("OK, you'll choose the firmware yourself.")
+            # the probe left the port in use / board running: find it again for flashing
+            ports = find_ports()
+            if ports and all(p.device != port for p in ports):
+                port = ports[0].device
+                print("(The board is now on %s.)" % port)
+
+    choices = [fw for fw in FIRMWARE if kind is None or fw[1] in FOR_BOARD[kind]]
+    default = 0
+    if st.get("last") in [n for _, n in choices]:
+        default = [n for _, n in choices].index(st["last"])
+    if len(choices) == 1:
+        text, asset_name = choices[0]
+        print("\nFirmware for this board: %s" % text)
+    else:
+        idx = pick("What do you want to put on it?", [t for t, _ in choices], default)
+        text, asset_name = choices[idx]
+    if "--dev" in sys.argv:
+        channel = "dev"
+    elif "--prod" in sys.argv:
+        channel = "stable"
+    else:
+        ch = pick("Which build?", ["Production (prod-latest) - recommended", "Development (dev-latest) - newest, untested"], 0)
+        channel = "stable" if ch == 0 else "dev"
+    print("Build: %s" % ("production" if channel == "stable" else "development"))
+
+    try:
+        path = fetch_firmware(asset_name, channel)
+    except (urllib.error.URLError, OSError) as e:
+        print("\nCouldn't download: %s" % e)
+        return 1
+    if not path and channel == "stable":
+        print("The production release doesn't have this file yet.")
+        if "--prod" not in sys.argv and ask("Try the development build instead? [Y/n] ", "y").lower().startswith("y"):
+            try:
+                path = fetch_firmware(asset_name, "dev")
+            except (urllib.error.URLError, OSError) as e:
+                print("\nCouldn't download: %s" % e)
+                return 1
+    if not path:
+        print("That firmware isn't available. Nothing was changed.")
+        return 1
+
+    print("\nAbout to flash")
+    print("  What:    %s" % text)
+    print("  Port:    %s" % port)
+    print("  Device:  %s  (MAC %s)" % (info.get("chip", "?"), info.get("mac", "?")))
+    print("  File:    %s  (%d bytes)" % (os.path.basename(path), os.path.getsize(path)))
+    print("  Build:   %s  [release tag '%s']" % ("production" if channel == "stable" or LAST_RELEASE.get("tag", "").startswith("prod") else "development", LAST_RELEASE.get("tag", "?")))
+    print("  Commit:  %s" % LAST_RELEASE.get("commit", "?"))
+    if not ask("Flash it now? [Y/n] ", "y").lower().startswith("y"):
+        print("Cancelled. Nothing was changed.")
+        return 0
+    rc, _ = run_esptool(["--chip", "esp32s3", "--port", port, "--baud", "460800",
+                         "write_flash", "0x0", path])
+    if rc != 0:
+        print("\nFlashing failed. Put the board in download mode (hold BOOT, tap RESET, release BOOT)")
+        print("and run this again. If it still fails, try a different USB cable or port.")
+        return 1
+    st["last"] = asset_name
+    save_state(st)
+    print("\nDone. Tap RESET on the board (or unplug and replug it) to start the new firmware.")
+    return 0
+
+
+FIRMWARE_NAMES = [n for _, n in FIRMWARE]
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+        sys.exit(1)

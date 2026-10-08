@@ -19,7 +19,9 @@ For use with the hCRI Companion Android app:
 
 ## Installing it (short version)
 
-1. Download `hcri-esp32-bridge-factory.bin` from the [`prod-latest`](../../releases/tag/prod-latest) release.
+1. Easiest: download `hcri_companion_esp32_bridge.py` from the [`prod-latest`](../../releases/tag/prod-latest) release and run it
+   (see "Easiest" below) -- it finds the port, identifies your board and flashes the right file. Otherwise:
+   download `hcri-esp32-bridge-factory.bin` (T-Display S3) from the same release.
 2. Put the board in download mode and flash that file at **0x0** (steps below -- Chrome or Edge is enough).
 3. Plug the spectrometer into the board with the OTG cable, power it from the power bank, and open
    the hCRI Companion app: the bridge appears as **Torch Bearer**.
@@ -40,6 +42,17 @@ Each release has `hcri-esp32-bridge-factory.bin` (everything in one file -- flas
 plus `firmware.bin`, `bootloader.bin`, `partitions.bin` and `SHA256SUMS.txt`.
 The GitHub Actions workflows in `.github/workflows/` build it with PlatformIO; you can also
 re-run one from the Actions tab (Run workflow).
+
+### Easiest: the hCRI Companion ESP32 Bridge program
+**`hcri_companion_esp32_bridge.py`** finds the board's USB port, identifies the board (T-Display S3 or T-Display-S3 Pro),
+downloads the right firmware (checksum-verified) and flashes it.
+
+- **Where to get it:** it is attached to every release -- download `hcri_companion_esp32_bridge.py` from the
+  [`prod-latest`](../../releases/tag/prod-latest) release (or [`dev-latest`](../../releases/tag/dev-latest) for the newest),
+  or find it in this repo at [`tools/hcri_companion_esp32_bridge.py`](tools/hcri_companion_esp32_bridge.py).
+- **Run it:** install [Python](https://www.python.org/downloads/), plug the board in, then
+  `py hcri_companion_esp32_bridge.py` (Windows) or `python3 hcri_companion_esp32_bridge.py`. It installs esptool if needed.
+- Options: `--prod` or `--dev` pick the build without asking, `--no-probe` skips identifying the board.
 
 ## Flashing a downloaded build
 

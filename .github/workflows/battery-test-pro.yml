@@ -1,0 +1,52 @@
+# Builds the standalone T-Display-S3 Pro battery-life tester (battery-test-pro/)
+# and publishes it at the fixed release tag "battery-test-pro-latest".
+name: Build battery tester (T-Display-S3 Pro)
+
+on:
+  push:
+    paths: ['battery-test-pro/**', '.github/workflows/battery-test-pro.yml']
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-bt-${{ runner.os }}-${{ hashFiles('battery-test-pro/platformio.ini') }}
+      - run: pip install platformio esptool==4.8.1
+      - name: Build (V1.1 and V1.0 backlight variants)
+        working-directory: battery-test-pro
+        run: pio run -e pro-v1_1 -e pro-v1_0
+      - name: Merge into single flashable images
+        working-directory: battery-test-pro
+        run: |
+          BOOT_APP0=$(find ~/.platformio/packages/framework-arduinoespressif32 -name boot_app0.bin | head -1)
+          for env in pro-v1_1 pro-v1_0; do
+            d=.pio/build/$env
+            python -m esptool --chip esp32s3 merge_bin -o $d/battery-test-$env.bin \
+              --flash_mode keep --flash_freq keep --flash_size keep \
+              0x0 $d/bootloader.bin 0x8000 $d/partitions.bin 0xe000 "$BOOT_APP0" 0x10000 $d/firmware.bin
+          done
+          sha256sum .pio/build/*/battery-test-*.bin | tee .pio/SHA256SUMS.txt
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: battery-test-pro-latest
+          name: "T-Display-S3 Pro battery tester"
+          prerelease: true
+          body: |
+            Standalone battery-life tester. Flash battery-test-pro-v1_1.bin at 0x0
+            (use pro-v1_0 only for the older V1.0 board). See battery-test-pro/README.md.
+          files: |
+            battery-test-pro/.pio/build/pro-v1_1/battery-test-pro-v1_1.bin
+            battery-test-pro/.pio/build/pro-v1_0/battery-test-pro-v1_0.bin
+            battery-test-pro/.pio/SHA256SUMS.txt
