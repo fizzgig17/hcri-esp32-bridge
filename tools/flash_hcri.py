@@ -3,6 +3,8 @@
 Find the ESP32 on USB, show what it is, download the right hCRI firmware and flash it.
 
     python flash_hcri.py            (Windows: py flash_hcri.py)
+    python flash_hcri.py --prod     skip the question: production build only
+    python flash_hcri.py --dev      skip the question: development build
 
 Needs Python 3.8+ and esptool (the script installs it with pip if it is missing).
 No other setup: it downloads the firmware from this repo's GitHub releases.
@@ -227,8 +229,14 @@ def main():
     default = FIRMWARE_NAMES.index(st["last"]) if st.get("last") in FIRMWARE_NAMES else 0
     idx = pick("What do you want to put on it?", [t for t, _ in FIRMWARE], default)
     text, asset_name = FIRMWARE[idx]
-    ch = pick("Which build?", ["Stable (recommended)", "Latest development build"], 0)
-    channel = "stable" if ch == 0 else "dev"
+    if "--dev" in sys.argv:
+        channel = "dev"
+    elif "--prod" in sys.argv:
+        channel = "stable"
+    else:
+        ch = pick("Which build?", ["Production (prod-latest) - recommended", "Development (dev-latest) - newest, untested"], 0)
+        channel = "stable" if ch == 0 else "dev"
+    print("Build: %s" % ("production" if channel == "stable" else "development"))
 
     try:
         path = fetch_firmware(asset_name, channel)
@@ -236,8 +244,8 @@ def main():
         print("\nCouldn't download: %s" % e)
         return 1
     if not path and channel == "stable":
-        print("The stable release doesn't have this file yet.")
-        if ask("Try the development build instead? [Y/n] ", "y").lower().startswith("y"):
+        print("The production release doesn't have this file yet.")
+        if "--prod" not in sys.argv and ask("Try the development build instead? [Y/n] ", "y").lower().startswith("y"):
             try:
                 path = fetch_firmware(asset_name, "dev")
             except (urllib.error.URLError, OSError) as e:
