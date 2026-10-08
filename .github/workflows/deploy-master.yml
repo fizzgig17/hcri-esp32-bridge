@@ -91,3 +91,4 @@ jobs:
             .pio/build/tdisplay-s3/bootloader.bin
             .pio/build/tdisplay-s3/partitions.bin
             .pio/build/tdisplay-s3/SHA256SUMS.txt
+            tools/hcri_companion_esp32_bridge.py
