@@ -4,6 +4,29 @@ Press the right button (GPIO14) or BOOT: the board asks the Torch Bearer for one
 auto-exposure scan over USB (CH340 serial, 115200 8N1) and shows peak wavelength,
 peak value, sum, exposure and a spectrum plot. GPLv3 (derived from Torch-Bearer-Tools / tobes-ui).
 
+## Hardware you need
+
+For use with the hCRI Companion Android app:
+
+- **Torch Bearer spectrometer** (the thing being bridged).
+- **LilyGO T-Display S3**, the standard non-Pro version with 16 MB flash. It is the bridge: it talks
+  USB to the spectrometer and Bluetooth LE to your phone.
+- **USB cable/adapter set**: a USB-C male OTG cable or adapter that gives you a female USB-A
+  (for the spectrometer) and a female USB-C (for power) at the same time.
+- **Power bank** to run the bridge in the field. (A PC USB port works for flashing only.)
+- **Android phone** with the hCRI Companion app (Android 8.0+, Bluetooth LE).
+- Optional: a diffuser in front of the lamp; about 25 cm distance works well.
+
+## Installing it (short version)
+
+1. Download `hcri-esp32-bridge-factory.bin` from the [`prod-latest`](../../releases/tag/prod-latest) release.
+2. Put the board in download mode and flash that file at **0x0** (steps below -- Chrome or Edge is enough).
+3. Plug the spectrometer into the board with the OTG cable, power it from the power bank, and open
+   the hCRI Companion app: the bridge appears as **Torch Bearer**.
+
+The board allows one Bluetooth connection at a time and stops advertising while connected, so close
+other Bluetooth tools (for example nRF Connect) if the app can't see it.
+
 ## Getting the firmware
 
 Two ways, same as the hCRI Companion app:
