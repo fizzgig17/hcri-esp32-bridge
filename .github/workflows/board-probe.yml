@@ -1,0 +1,53 @@
+# Builds the tiny board-probe program (board-probe/) used by the hCRI Companion ESP32 Bridge
+# flasher to tell the T-Display-S3 Pro from the plain T-Display S3, and publishes it at the
+# fixed release tag "board-probe-latest".
+name: Build board probe
+
+on:
+  push:
+    paths: ['board-probe/**', '.github/workflows/board-probe.yml']
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-probe-${{ runner.os }}-${{ hashFiles('board-probe/platformio.ini') }}
+      - run: pip install platformio esptool==4.8.1
+      - name: Build
+        working-directory: board-probe
+        run: |
+          set +e
+          pio run 2>&1 | tee build.log
+          rc=${PIPESTATUS[0]}
+          if [ $rc -ne 0 ]; then
+            grep -E "error|Error|undefined reference" build.log | head -15 | while IFS= read -r l; do echo "::error::${l:0:400}"; done
+          fi
+          exit $rc
+      - name: Merge into a single flashable image
+        working-directory: board-probe/.pio/build/board-probe
+        run: |
+          python -m esptool --chip esp32s3 merge_bin -o board-probe.bin \
+            --flash_mode keep --flash_freq keep --flash_size keep \
+            0x0 bootloader.bin 0x8000 partitions.bin 0x10000 firmware.bin
+          sha256sum board-probe.bin | tee SHA256SUMS.txt
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: board-probe-latest
+          name: "Board probe"
+          prerelease: true
+          body: Tiny program the flasher uses to identify the board. Flash at 0x0.
+          files: |
+            board-probe/.pio/build/board-probe/board-probe.bin
+            board-probe/.pio/build/board-probe/SHA256SUMS.txt
