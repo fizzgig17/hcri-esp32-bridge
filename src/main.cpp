@@ -1,6 +1,10 @@
-// Torch Bearer scanner for the LilyGo T-Display S3 (non-Pro).
+// Torch Bearer scanner for the LilyGo T-Display S3 and the T-Display-S3 Pro.
 //
-// Press the right-hand button (GPIO14) or BOOT (GPIO0) to take one scan.
+// One source, two builds: the default build is the plain T-Display S3; the
+// `tdisplay-s3-pro` PlatformIO environment defines BOARD_PRO and targets the Pro
+// (SPI ST7796 screen, SY6970 power chip) and also shows the battery percentage.
+//
+// Press the right-hand button (GPIO14; GPIO12 on the Pro) or BOOT (GPIO0) to take one scan.
 // The ESP32-S3 acts as a USB host and talks to the spectrometer's CH340
 // USB-to-serial bridge (VID 1A86 / PID 7523) at 115200 8N1.
 //
@@ -25,6 +29,10 @@
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_vendor.h"
+#ifdef BOARD_PRO
+#include "driver/spi_master.h"
+#include "driver/i2c.h"
+#endif
 
 #include "usb/usb_host.h"
 #include "usb/cdc_acm_host.h"
@@ -46,6 +54,20 @@ using namespace esp_usb;
 static const char *TAG = "tobes";
 
 // ---------------------------------------------------------------- pins ----
+#ifdef BOARD_PRO
+// LilyGo T-Display-S3 Pro: ST7796 on SPI, SY6970 power chip on I2C.
+#define PIN_LCD_BL    48
+#define PIN_LCD_CS    39
+#define PIN_LCD_DC    9
+#define PIN_LCD_RST   47
+#define PIN_SPI_SCK   18
+#define PIN_SPI_MOSI  17
+#define PIN_SD_CS     14   // shares the SPI bus; keep it deselected
+#define PIN_I2C_SDA   5
+#define PIN_I2C_SCL   6
+#define PIN_BTN_A     0    // BOOT
+#define PIN_BTN_B     12   // user button 2
+#else
 #define PIN_POWER_ON 15
 #define PIN_LCD_BL   38
 #define PIN_LCD_RD   9
@@ -56,6 +78,7 @@ static const char *TAG = "tobes";
 static const int PIN_LCD_D[8] = {39, 40, 41, 42, 45, 46, 47, 48};
 #define PIN_BTN_A    0   // BOOT
 #define PIN_BTN_B    14
+#endif
 
 // ------------------------------------------------------------- display ----
 #define W 320
@@ -72,6 +95,100 @@ static const uint16_t BLACK = 0, WHITE = rgb(255, 255, 255), GREY = rgb(110, 110
                       GREEN = rgb(60, 220, 90), RED = rgb(255, 70, 70),
                       YELLOW = rgb(255, 210, 50), CYAN = rgb(70, 200, 255);
 
+#ifdef BOARD_PRO
+// The UI is drawn into a 320x170 frame buffer (as on the plain T-Display S3) and shown centred on
+// the Pro's 480x222 landscape screen.
+#define PANEL_W 480
+#define PANEL_H 222
+#define PANEL_COL_OFFSET 49   // the 222-pixel-wide glass starts at column 49 of the ST7796's 320
+#define FB_X ((PANEL_W - W) / 2)
+#define FB_Y ((PANEL_H - H) / 2)
+static esp_lcd_panel_io_handle_t lcd_io;
+
+static void st_cmd(uint8_t c, const uint8_t *d = nullptr, size_t n = 0) {
+    ESP_ERROR_CHECK(esp_lcd_panel_io_tx_param(lcd_io, c, d, n));
+}
+static void st_cmd1(uint8_t c, uint8_t v) { st_cmd(c, &v, 1); }
+
+// Write a w*h block of RGB565 to the landscape position (x, y).
+static void blit(int x, int y, int w, int h, const void *data) {
+    uint8_t ca[4] = {(uint8_t)(x >> 8), (uint8_t)x, (uint8_t)((x + w - 1) >> 8), (uint8_t)(x + w - 1)};
+    int ys = y + PANEL_COL_OFFSET, ye = y + h - 1 + PANEL_COL_OFFSET;
+    uint8_t ra[4] = {(uint8_t)(ys >> 8), (uint8_t)ys, (uint8_t)(ye >> 8), (uint8_t)ye};
+    st_cmd(0x2A, ca, 4);
+    st_cmd(0x2B, ra, 4);
+    ESP_ERROR_CHECK(esp_lcd_panel_io_tx_color(lcd_io, 0x2C, data, (size_t)w * h * 2));
+}
+
+static void lcd_init() {
+    gpio_config_t o = {};
+    o.mode = GPIO_MODE_OUTPUT;
+    o.pin_bit_mask = (1ULL << PIN_LCD_BL) | (1ULL << PIN_SD_CS) | (1ULL << PIN_LCD_RST);
+    gpio_config(&o);
+    gpio_set_level((gpio_num_t)PIN_LCD_BL, 0);
+    gpio_set_level((gpio_num_t)PIN_SD_CS, 1);
+
+    spi_bus_config_t bc = {};
+    bc.mosi_io_num = PIN_SPI_MOSI;
+    bc.miso_io_num = -1;
+    bc.sclk_io_num = PIN_SPI_SCK;
+    bc.quadwp_io_num = -1;
+    bc.quadhd_io_num = -1;
+    bc.max_transfer_sz = W * H * 2 + 64;
+    ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &bc, SPI_DMA_CH_AUTO));
+
+    esp_lcd_panel_io_spi_config_t ic = {};
+    ic.cs_gpio_num = PIN_LCD_CS;
+    ic.dc_gpio_num = PIN_LCD_DC;
+    ic.spi_mode = 0;
+    ic.pclk_hz = 40 * 1000 * 1000;
+    ic.trans_queue_depth = 10;
+    ic.lcd_cmd_bits = 8;
+    ic.lcd_param_bits = 8;
+    ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)SPI2_HOST, &ic, &lcd_io));
+
+    // Hardware reset
+    gpio_set_level((gpio_num_t)PIN_LCD_RST, 1);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    gpio_set_level((gpio_num_t)PIN_LCD_RST, 0);
+    vTaskDelay(pdMS_TO_TICKS(120));
+    gpio_set_level((gpio_num_t)PIN_LCD_RST, 1);
+    vTaskDelay(pdMS_TO_TICKS(120));
+
+    // ST7796 start-up sequence (same values as LilyGo's Arduino_GFX driver for this board)
+    st_cmd1(0x3A, 0x55);                           // 16-bit colour
+    st_cmd1(0xF0, 0xC3); st_cmd1(0xF0, 0x96);      // command set control
+    st_cmd1(0xB4, 0x01);
+    { const uint8_t d[] = {0x80, 0x22, 0x3B}; st_cmd(0xB6, d, sizeof d); }
+    { const uint8_t d[] = {0x40, 0x8A, 0x00, 0x00, 0x29, 0x19, 0xA5, 0x33}; st_cmd(0xE8, d, sizeof d); }
+    st_cmd1(0xC1, 0x06); st_cmd1(0xC2, 0xA7); st_cmd1(0xC5, 0x18);
+    { const uint8_t d[] = {0xF0, 0x09, 0x0B, 0x06, 0x04, 0x15, 0x2F, 0x54, 0x42, 0x3C, 0x17, 0x14, 0x18, 0x1B}; st_cmd(0xE0, d, sizeof d); }
+    { const uint8_t d[] = {0xE0, 0x09, 0x0B, 0x06, 0x04, 0x03, 0x2B, 0x43, 0x42, 0x3B, 0x16, 0x14, 0x17, 0x1B}; st_cmd(0xE1, d, sizeof d); }
+    st_cmd1(0xF0, 0x3C); st_cmd1(0xF0, 0x69);
+    st_cmd(0x11);                                  // sleep out
+    vTaskDelay(pdMS_TO_TICKS(120));
+    st_cmd(0x38);
+    st_cmd(0x21);                                  // IPS panel: inversion on
+    st_cmd1(0x36, 0x68);                           // landscape (MX | MV | BGR); if the picture is upside down try 0xA8
+    st_cmd(0x29);                                  // display on
+
+    fb = (uint16_t *)heap_caps_malloc(W * H * 2, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    assert(fb);
+    memset(fb, 0, W * H * 2);
+    // Blank the whole glass (the frame buffer is zeroed, so reuse it as the source).
+    blit(0, 0, W, H, fb);
+    blit(W, 0, PANEL_W - W, H, fb);
+    blit(0, H, W, PANEL_H - H, fb);
+    blit(W, H, PANEL_W - W, PANEL_H - H, fb);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    gpio_set_level((gpio_num_t)PIN_LCD_BL, 1);
+}
+
+static void present() {
+    blit(FB_X, FB_Y, W, H, fb);
+    vTaskDelay(pdMS_TO_TICKS(40));  // let the DMA finish before fb is touched again
+}
+#else
 static void lcd_init() {
     gpio_config_t o = {};
     o.mode = GPIO_MODE_OUTPUT;
@@ -131,6 +248,8 @@ static void present() {
     vTaskDelay(pdMS_TO_TICKS(40));  // let the DMA finish before fb is touched again
 }
 
+#endif
+
 static void clear() { memset(fb, 0, W * H * 2); }
 
 static inline void px(int x, int y, uint16_t c) {
@@ -185,6 +304,119 @@ static void textf(int x, int y, int scale, uint16_t c, const char *fmt, ...) {
     va_end(ap);
     text(x, y, b, scale, c);
 }
+
+// ------------------------------------------------------------- battery ----
+// Pro only: the SY6970 power chip (I2C 0x6A) reports battery voltage and whether USB power is present.
+// Shown in the header as "87%" on battery, or a lightning bolt plus "87%" while USB power is connected.
+#ifdef BOARD_PRO
+#define SY6970_ADDR 0x6A
+#define BATT_X 150   // left edge of the indicator in the header
+#define BATT_W 62
+
+struct BattState {
+    int pct = -1;        // -1 = no valid reading yet
+    bool plugged = false;
+};
+static BattState batt;
+
+static bool pmu_read(uint8_t reg, uint8_t *v) {
+    return i2c_master_write_read_device(I2C_NUM_0, SY6970_ADDR, &reg, 1, v, 1, pdMS_TO_TICKS(50)) == ESP_OK;
+}
+static bool pmu_write(uint8_t reg, uint8_t v) {
+    uint8_t b[2] = {reg, v};
+    return i2c_master_write_to_device(I2C_NUM_0, SY6970_ADDR, b, 2, pdMS_TO_TICKS(50)) == ESP_OK;
+}
+
+static void battery_init() {
+    i2c_config_t c = {};
+    c.mode = I2C_MODE_MASTER;
+    c.sda_io_num = PIN_I2C_SDA;
+    c.scl_io_num = PIN_I2C_SCL;
+    c.sda_pullup_en = GPIO_PULLUP_ENABLE;
+    c.scl_pullup_en = GPIO_PULLUP_ENABLE;
+    c.master.clk_speed = 100000;
+    i2c_param_config(I2C_NUM_0, &c);
+    i2c_driver_install(I2C_NUM_0, c.mode, 0, 0, 0);
+    uint8_t r02;
+    if (pmu_read(0x02, &r02)) pmu_write(0x02, r02 | 0x40);   // continuous battery-voltage conversion
+}
+
+// Rough single-cell LiPo state of charge from the voltage (4.2 V full). The voltage is the real
+// measurement; this is only an estimate for the on-screen percentage.
+static int approx_percent(int mv) {
+    static const int v[] = {3300, 3500, 3600, 3700, 3750, 3800, 3850, 3900, 3950, 4000, 4100, 4200};
+    static const int p[] = {0, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100};
+    if (mv <= v[0]) return 0;
+    if (mv >= v[11]) return 100;
+    for (int i = 1; i < 12; i++)
+        if (mv < v[i]) return p[i - 1] + (p[i] - p[i - 1]) * (mv - v[i - 1]) / (v[i] - v[i - 1]);
+    return 100;
+}
+
+// Reads the chip; returns true if the displayed values changed.
+static bool battery_poll() {
+    uint8_t r02 = 0, r0b = 0, r0e = 0, r11 = 0;
+    if (!pmu_read(0x02, &r02) || !pmu_read(0x0B, &r0b) || !pmu_read(0x0E, &r0e) || !pmu_read(0x11, &r11)) return false;
+    if (!(r02 & 0x40)) pmu_write(0x02, r02 | 0x40);   // keep the ADC converting continuously
+    int mv = 2304 + (r0e & 0x7F) * 20;                // REG0E: battery voltage, 20 mV steps
+    if (mv < 2500) return false;                      // ADC hasn't produced a value yet
+    bool plugged = (r11 & 0x80) != 0;                 // REG11 bit 7: VBUS good
+    int chrg = (r0b >> 3) & 3;                        // REG0B: 0 idle, 1 pre-charge, 2 fast charge, 3 done
+    int pct = approx_percent(mv);
+    if (plugged) pct = (chrg == 3) ? 100 : (pct > 99 ? 99 : pct);  // voltage reads high while charging
+    bool changed = pct != batt.pct || plugged != batt.plugged;
+    batt.pct = pct;
+    batt.plugged = plugged;
+    return changed;
+}
+
+// Filled lightning bolt, about 10 x 14 pixels, top-left at (x, y).
+static void draw_bolt(int x, int y, uint16_t c) {
+    static const int P[6][2] = {{6, 0}, {1, 7}, {4, 7}, {2, 13}, {9, 5}, {6, 5}};
+    for (int j = 0; j < 14; j++) {
+        float yy = j + 0.5f;
+        float xs[6];
+        int n = 0;
+        for (int i = 0; i < 6; i++) {
+            const int *a = P[i], *b = P[(i + 1) % 6];
+            if ((a[1] <= yy) != (b[1] <= yy)) xs[n++] = a[0] + (yy - a[1]) * (b[0] - a[0]) / (float)(b[1] - a[1]);
+        }
+        for (int i = 0; i < n; i++)
+            for (int k = i + 1; k < n; k++)
+                if (xs[k] < xs[i]) { float t = xs[i]; xs[i] = xs[k]; xs[k] = t; }
+        for (int i = 0; i + 1 < n; i += 2)
+            for (int xx = (int)ceilf(xs[i] - 0.5f); xx < (int)ceilf(xs[i + 1] - 0.5f); xx++) px(x + xx, y + j, c);
+    }
+}
+
+static void draw_battery() {
+    fill(BATT_X, 3, BATT_W, 16, BLACK);
+    if (batt.pct < 0) return;
+    uint16_t col = batt.pct < 15 && !batt.plugged ? RED : WHITE;
+    char b[8];
+    snprintf(b, sizeof b, "%d%%", batt.pct);
+    int w = (int)strlen(b) * 12;
+    int x = BATT_X + BATT_W - w;                      // right-aligned
+    if (batt.plugged) draw_bolt(x - 13, 4, YELLOW);
+    text(x, 4, b, 2, col);
+}
+
+// Called from the idle loops: refresh the indicator (at most every 5 s) and redraw if it changed.
+static void battery_tick() {
+    static int64_t last = -5000000;
+    int64_t now = esp_timer_get_time();
+    if (now - last < 5000000) return;
+    last = now;
+    if (battery_poll()) {
+        draw_battery();
+        present();
+    }
+}
+#else
+static void battery_init() {}
+static void draw_battery() {}
+static void battery_tick() {}
+#endif
 
 // ----------------------------------------------------------- USB serial ----
 static std::unique_ptr<CdcAcmDevice> vcp;
@@ -624,6 +856,7 @@ static void ble_start() {
 static void header(const char *right, uint16_t rc) {
     text(6, 4, "TORCH BEARER", 2, WHITE);
     text(W - 6 - (int)strlen(right) * 12, 4, right, 2, rc);
+    draw_battery();
     for (int x = 0; x < W; x++) px(x, 22, GREY);
 }
 
@@ -714,6 +947,7 @@ extern "C" void app_main() {
     gpio_config(&bi);
 
     lcd_init();
+    battery_init();
     usb_start();
     ble_start();
     ui_waiting();
@@ -727,6 +961,7 @@ extern "C" void app_main() {
             } else {
                 vcp.reset();
                 if (ble_scan_req) { ble_scan_req = false; ble_status(3, 0, 0); }
+                battery_tick();
                 vTaskDelay(pdMS_TO_TICKS(500));
             }
         }
@@ -759,6 +994,7 @@ extern "C" void app_main() {
                 if (from_button) while (button_pressed()) vTaskDelay(pdMS_TO_TICKS(20));
                 // result stays on screen; the next press or BLE command starts a new scan
             }
+            battery_tick();
             vTaskDelay(pdMS_TO_TICKS(20));
         }
 
