@@ -41,6 +41,10 @@ plus `firmware.bin`, `bootloader.bin`, `partitions.bin` and `SHA256SUMS.txt`.
 The GitHub Actions workflows in `.github/workflows/` build it with PlatformIO; you can also
 re-run one from the Actions tab (Run workflow).
 
+### Easiest: the flasher script
+`tools/flash_hcri.py` finds the board's USB port, shows the chip, downloads the firmware you pick from the
+releases (checksum-verified) and flashes it: `python tools/flash_hcri.py` (it installs esptool if needed).
+
 ## Flashing a downloaded build
 
 1. **Put the board in download mode** (needed any time the firmware is running -- it takes over
