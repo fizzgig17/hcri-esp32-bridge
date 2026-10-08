@@ -53,7 +53,14 @@ jobs:
         run: pip install platformio esptool==4.8.1
 
       - name: Build firmware
-        run: pio run -e tdisplay-s3 -e tdisplay-s3-pro
+        run: |
+          set +e
+          pio run -e tdisplay-s3 -e tdisplay-s3-pro 2>&1 | tee build.log
+          rc=${PIPESTATUS[0]}
+          if [ $rc -ne 0 ]; then
+            grep -E "error|Error|undefined reference" build.log | head -15 | while IFS= read -r l; do echo "::error::${l:0:400}"; done
+          fi
+          exit $rc
 
       - name: Merge into a single flashable image
         working-directory: .pio/build/tdisplay-s3
