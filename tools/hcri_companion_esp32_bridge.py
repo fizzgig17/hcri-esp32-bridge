@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Find the ESP32 on USB, show what it is, download the right hCRI firmware and flash it.
+hCRI Companion ESP32 Bridge -- find the ESP32 on USB, show what it is, download the right firmware and flash it.
 
-    python flash_hcri.py            (Windows: py flash_hcri.py)
-    python flash_hcri.py --prod     skip the question: production build only
-    python flash_hcri.py --dev      skip the question: development build
+    python hcri_companion_esp32_bridge.py            (Windows: py hcri_companion_esp32_bridge.py)
+    python hcri_companion_esp32_bridge.py --prod     skip the question: production build only
+    python hcri_companion_esp32_bridge.py --dev      skip the question: development build
 
 Needs Python 3.8+ and esptool (the script installs it with pip if it is missing).
 No other setup: it downloads the firmware from this repo's GitHub releases.
@@ -23,7 +23,7 @@ import urllib.error
 import urllib.request
 
 REPO = "fizzgig17/hcri-esp32-bridge"
-STATE_FILE = os.path.join(os.path.expanduser("~"), ".hcri-flash.json")
+STATE_FILE = os.path.join(os.path.expanduser("~"), ".hcri-companion-esp32-bridge.json")
 
 # (menu text, release asset name, boards it applies to)
 FIRMWARE = [
@@ -118,7 +118,7 @@ def probe(port):
 
 
 def http_json(url):
-    req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json", "User-Agent": "hcri-flash"})
+    req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json", "User-Agent": "hcri-companion-esp32-bridge"})
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.load(r)
 
@@ -158,7 +158,7 @@ def find_asset(tag, name):
 
 
 def download(url, dest):
-    req = urllib.request.Request(url, headers={"User-Agent": "hcri-flash"})
+    req = urllib.request.Request(url, headers={"User-Agent": "hcri-companion-esp32-bridge"})
     with urllib.request.urlopen(req, timeout=120) as r, open(dest, "wb") as f:
         total = int(r.headers.get("Content-Length") or 0)
         got = 0
@@ -220,8 +220,8 @@ def main():
     ensure_esptool()
     st = load_state()
 
-    print("hCRI firmware flasher")
-    print("=====================")
+    print("hCRI Companion ESP32 Bridge")
+    print("===========================")
     ports = find_ports()
     if not ports:
         print("\nNo ESP32 found on USB.")
