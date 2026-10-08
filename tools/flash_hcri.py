@@ -123,8 +123,30 @@ def http_json(url):
         return json.load(r)
 
 
+LAST_RELEASE = {}
+
+
+def tag_commit(tag):
+    """Commit the release tag points at (short hash), or '?' if it can't be looked up."""
+    try:
+        ref = http_json("https://api.github.com/repos/%s/git/ref/tags/%s" % (REPO, tag))
+        sha = ref["object"]["sha"]
+        if ref["object"].get("type") == "tag":   # annotated tag -> follow to the commit
+            sha = http_json("https://api.github.com/repos/%s/git/tags/%s" % (REPO, sha))["object"]["sha"]
+        try:
+            when = http_json("https://api.github.com/repos/%s/commits/%s" % (REPO, sha))["commit"]["committer"]["date"]
+            when = when[:19].replace("T", " ") + " UTC"
+        except Exception:
+            when = "?"
+        return sha[:7] + " (" + when + ")"
+    except Exception:
+        return "?"
+
+
 def find_asset(tag, name):
     rel = http_json("https://api.github.com/repos/%s/releases/tags/%s" % (REPO, tag))
+    LAST_RELEASE.clear()
+    LAST_RELEASE.update({"tag": tag, "commit": tag_commit(tag)})
     sums = None
     asset = None
     for a in rel.get("assets", []):
@@ -158,6 +180,7 @@ def fetch_firmware(asset_name, channel):
     if not asset:
         return None
     dest = os.path.join(tempfile.gettempdir(), asset_name)
+    LAST_RELEASE["size"] = asset.get("size", 0)
     download(asset["browser_download_url"], dest)
     with open(dest, "rb") as f:
         digest = hashlib.sha256(f.read()).hexdigest()
@@ -255,8 +278,13 @@ def main():
         print("That firmware isn't available. Nothing was changed.")
         return 1
 
-    print("\nAbout to flash: %s" % text)
-    print("Port: %s   File: %s" % (port, os.path.basename(path)))
+    print("\nAbout to flash")
+    print("  What:    %s" % text)
+    print("  Port:    %s" % port)
+    print("  Device:  %s  (MAC %s)" % (info.get("chip", "?"), info.get("mac", "?")))
+    print("  File:    %s  (%d bytes)" % (os.path.basename(path), os.path.getsize(path)))
+    print("  Build:   %s  [release tag '%s']" % ("production" if channel == "stable" or LAST_RELEASE.get("tag", "").startswith("prod") else "development", LAST_RELEASE.get("tag", "?")))
+    print("  Commit:  %s" % LAST_RELEASE.get("commit", "?"))
     if not ask("Flash it now? [Y/n] ", "y").lower().startswith("y"):
         print("Cancelled. Nothing was changed.")
         return 0
