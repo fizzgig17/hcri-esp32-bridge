@@ -1,0 +1,5 @@
+.pio/
+.vscode/
+managed_components/
+sdkconfig.tdisplay-s3
+dependencies.lock

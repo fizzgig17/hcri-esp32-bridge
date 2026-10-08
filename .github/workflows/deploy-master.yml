@@ -1,0 +1,93 @@
+# .github/workflows/deploy-master.yml
+#
+# Builds the ESP32 bridge firmware on every push to `master` and publishes
+# it as a GitHub Release at a fixed, moving tag ("prod-latest") -- the same
+# scheme the hCRI Companion app uses (see that repo's deploy-master.yml), so the
+# download URL never changes. Mirrors deploy-dev.yml (tag "dev-latest").
+#
+# Nothing here needs repo secrets: the firmware isn't signed, and the release
+# is published with the built-in GITHUB_TOKEN.
+#
+# One-time repo setting this relies on: Settings -> Actions -> General ->
+# "Workflow permissions" must be "Read and write permissions" -- otherwise
+# the release step below gets a 403.
+#
+# Release files:
+#   hcri-esp32-bridge-factory.bin  bootloader + partition table + app merged
+#                                  into ONE image, flash at 0x0 (use this one)
+#   firmware.bin                   the app alone (flash at 0x10000 -- only for
+#                                  boards already running this firmware's layout)
+#   bootloader.bin, partitions.bin the other two pieces, for completeness
+#   SHA256SUMS.txt                 checksums of the above
+
+name: Build and publish firmware (prod)
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # The first build downloads the ESP-IDF toolchain (~1 GB); caching the
+      # PlatformIO home dir makes later builds much faster. Keyed on
+      # platformio.ini so a platform/board change refreshes it.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+          restore-keys: pio-${{ runner.os }}-
+
+      - name: Install PlatformIO and esptool
+        run: pip install platformio esptool==4.8.1
+
+      - name: Build firmware
+        run: pio run -e tdisplay-s3
+
+      - name: Merge into a single flashable image
+        working-directory: .pio/build/tdisplay-s3
+        run: |
+          ls -l
+          # ESP32-S3 layout: bootloader at 0x0, partition table at 0x8000,
+          # app at 0x10000. "keep" leaves the flash mode/frequency/size the
+          # build already wrote into the bootloader header untouched.
+          python -m esptool --chip esp32s3 merge_bin \
+            -o hcri-esp32-bridge-factory.bin \
+            --flash_mode keep --flash_freq keep --flash_size keep \
+            0x0 bootloader.bin 0x8000 partitions.bin 0x10000 firmware.bin
+          sha256sum hcri-esp32-bridge-factory.bin firmware.bin bootloader.bin partitions.bin | tee SHA256SUMS.txt
+
+      - name: Move prod-latest tag to this commit
+        run: |
+          git tag -f prod-latest
+          git push origin -f prod-latest
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: prod-latest
+          name: "Production firmware (${{ github.sha }})"
+          prerelease: true
+          body: |
+            Automatically published from `master` at ${{ github.sha }}.
+            Overwritten on every push to `master`.
+
+            To flash: download `hcri-esp32-bridge-factory.bin` and write it at
+            address 0x0 -- see the README's "Flashing" section.
+          files: |
+            .pio/build/tdisplay-s3/hcri-esp32-bridge-factory.bin
+            .pio/build/tdisplay-s3/firmware.bin
+            .pio/build/tdisplay-s3/bootloader.bin
+            .pio/build/tdisplay-s3/partitions.bin
+            .pio/build/tdisplay-s3/SHA256SUMS.txt

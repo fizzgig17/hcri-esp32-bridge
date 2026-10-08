@@ -1,0 +1,3 @@
+dependencies:
+  espressif/usb_host_ch34x_vcp: ">=1.0.0"
+  espressif/usb_host_vcp: ">=1.0.0"
