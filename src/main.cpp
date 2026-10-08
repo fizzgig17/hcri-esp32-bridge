@@ -327,6 +327,30 @@ static bool pmu_write(uint8_t reg, uint8_t v) {
     return i2c_master_write_to_device(I2C_NUM_0, SY6970_ADDR, b, 2, pdMS_TO_TICKS(50)) == ESP_OK;
 }
 
+// Battery-powered host: with no outside power on the USB-C port, switch the SY6970 from charging to its
+// 5 V boost so the port powers the spectrometer (through a USB-C to USB-A adapter) while the ESP32 reads it.
+// While outside power is present the boost is off and the battery charges normally. Compile out with -DPRO_OTG_BOOST=0.
+#ifndef PRO_OTG_BOOST
+#define PRO_OTG_BOOST 1
+#endif
+static bool otg_on = false;
+static void otg_update(bool plugged) {
+#if PRO_OTG_BOOST
+    uint8_t r03;
+    if (!pmu_read(0x03, &r03)) return;
+    bool want = !plugged;
+    if (want && !(r03 & 0x20)) {
+        pmu_write(0x03, (uint8_t)((r03 | 0x20) & ~0x10));   // OTG_CONFIG on, CHG_CONFIG off
+        otg_on = true;
+    } else if (!want && (r03 & 0x20)) {
+        pmu_write(0x03, (uint8_t)((r03 & ~0x20) | 0x10));   // boost off, charging back on
+        otg_on = false;
+    }
+#else
+    (void)plugged;
+#endif
+}
+
 static void battery_init() {
     i2c_config_t c = {};
     c.mode = I2C_MODE_MASTER;
@@ -339,6 +363,10 @@ static void battery_init() {
     i2c_driver_install(I2C_NUM_0, c.mode, 0, 0, 0);
     uint8_t r02;
     if (pmu_read(0x02, &r02)) pmu_write(0x02, r02 | 0x40);   // continuous battery-voltage conversion
+    uint8_t r0b = 0, r11 = 0;
+    bool plugged = pmu_read(0x0B, &r0b) && pmu_read(0x11, &r11) && (r11 & 0x80) && ((r0b >> 5) != 7);
+    otg_update(plugged);
+    if (otg_on) vTaskDelay(pdMS_TO_TICKS(400));              // let the spectrometer power up before USB starts
 }
 
 // Rough single-cell LiPo state of charge from the voltage (4.2 V full). The voltage is the real
@@ -360,7 +388,9 @@ static bool battery_poll() {
     if (!(r02 & 0x40)) pmu_write(0x02, r02 | 0x40);   // keep the ADC converting continuously
     int mv = 2304 + (r0e & 0x7F) * 20;                // REG0E: battery voltage, 20 mV steps
     if (mv < 2500) return false;                      // ADC hasn't produced a value yet
-    bool plugged = (r11 & 0x80) != 0;                 // REG11 bit 7: VBUS good
+    bool boosting = ((r0b >> 5) & 7) == 7;            // REG0B VBUS_STAT 7: the chip itself is sourcing 5 V
+    bool plugged = (r11 & 0x80) != 0 && !boosting;    // REG11 bit 7: VBUS good (outside power)
+    otg_update(plugged);
     int chrg = (r0b >> 3) & 3;                        // REG0B: 0 idle, 1 pre-charge, 2 fast charge, 3 done
     int pct = approx_percent(mv);
     if (plugged) pct = (chrg == 3) ? 100 : (pct > 99 ? 99 : pct);  // voltage reads high while charging
