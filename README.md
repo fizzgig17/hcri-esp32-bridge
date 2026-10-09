@@ -14,6 +14,13 @@ For use with the hCRI Companion Android app:
 - **USB cable/adapter set**: a USB-C male OTG cable or adapter that gives you a female USB-A
   (for the spectrometer) and a female USB-C (for power) at the same time.
 - **Power bank** to run the bridge in the field. (A PC USB port works for flashing only.)
+- **T-Display-S3 Pro (battery model):** shows the battery percentage in the header (a lightning bolt
+  too while outside power is connected). With nothing plugged into its USB-C port it can run the
+  Torch Bearer from its own battery: use a plain USB-C male to USB-A female OTG adapter, plug the
+  Torch Bearer's USB-A cable into it, and the board's power chip supplies 5 V from the battery.
+  While outside power is connected the 5 V output is off and the battery charges as usual; the
+  battery does not charge while it is powering the Torch Bearer. This feature is untested on
+  hardware (compile it out with `-DPRO_OTG_BOOST=0`).
 - **Android phone** with the hCRI Companion app (Android 8.0+, Bluetooth LE).
 - Optional: a diffuser in front of the lamp; about 25 cm distance works well.
 
