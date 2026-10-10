@@ -464,21 +464,33 @@ static void draw_battery() {
     text(x, 4, b, 2, col);
 }
 
+// Power-chip state line on the idle screens (NO USB / READY): input status, charge state, fault flags, battery mV.
+static bool diag_on = false;
+static void draw_diag() {
+    fill(0, 134, W, 20, BLACK);
+    if (dbg_stat < 0) return;
+    char d[40];
+    snprintf(d, sizeof d, "S%d C%d F%02X %dmV", dbg_stat, dbg_chrg, dbg_fault, dbg_mv);
+    text(20, 140, d, 2, GREY);
+}
+
 // Called from the idle loops: refresh the indicator (at most every 5 s) and redraw if it changed.
 static void battery_tick() {
     static int64_t last = -5000000;
     int64_t now = esp_timer_get_time();
     if (now - last < 5000000) return;
     last = now;
-    if (battery_poll()) {
-        draw_battery();
-        present();
-    }
+    bool ch = battery_poll();
+    if (ch) draw_battery();
+    if (diag_on) draw_diag();
+    if (ch || diag_on) present();
 }
 #else
 static void battery_init() {}
 static void draw_battery() {}
 static void battery_tick() {}
+static bool diag_on = false;
+static void draw_diag() {}
 #endif
 
 // ----------------------------------------------------------- USB serial ----
@@ -928,13 +940,8 @@ static void ui_waiting() {
     header("NO USB", RED);
     text(20, 70, "PLUG IN SPECTROMETER", 2, YELLOW);
     text(20, 100, "VIA OTG CABLE", 2, GREY);
-#ifdef BOARD_PRO
-    if (dbg_stat >= 0) {   // power-chip state at the last poll: input status, charge state, fault flags, battery mV
-        char d[40];
-        snprintf(d, sizeof d, "S%d C%d F%02X %dmV", dbg_stat, dbg_chrg, dbg_fault, dbg_mv);
-        text(20, 140, d, 2, GREY);
-    }
-#endif
+    diag_on = true;
+    draw_diag();
     present();
 }
 
@@ -944,10 +951,13 @@ static void ui_ready() {
     text(6, 32, device_id, 1, GREY);
     textf(6, 48, 1, GREY, "RANGE %d-%d NM", range_lo, range_hi);
     text(20, 90, "PRESS BUTTON TO SCAN", 2, WHITE);
+    diag_on = true;
+    draw_diag();
     present();
 }
 
 static void ui_progress(int tries, float exp_ms, int status) {
+    diag_on = false;
     ble_status(1, (uint8_t)tries, exp_ms);
     clear();
     header("SCANNING", YELLOW);
@@ -961,6 +971,7 @@ static void ui_progress(int tries, float exp_ms, int status) {
 static void ui_scanning() { ui_progress(0, 0, 2); }
 
 static void ui_result(bool ok) {
+    diag_on = false;
     int n = scan.npts;
     Stats t = stats_of(scan);
     float mx = t.mx;
