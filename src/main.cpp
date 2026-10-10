@@ -735,7 +735,8 @@ static uint8_t own_addr_type;
 static volatile bool ble_scan_req = false;
 static volatile bool ble_resend_req = false;
 static bool have_result = false;
-static uint8_t last_state[6] = {0};
+// State 3 = no spectrometer: that is what a phone must read when it connects before one is plugged in (it becomes 0 'ready' once USB connects).
+static uint8_t last_state[6] = {3};
 
 struct Stats { int pk; float mx, sum; };
 static Stats stats_of(const Scan &s) {
