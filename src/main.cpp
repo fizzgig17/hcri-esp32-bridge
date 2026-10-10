@@ -405,7 +405,21 @@ static bool battery_poll() {
     otg_update(plugged);
     int chrg = (r0b >> 3) & 3;                        // REG0B: 0 idle, 1 pre-charge, 2 fast charge, 3 done
     int pct = approx_percent(mv);
-    if (plugged) pct = (chrg == 3) ? 100 : (pct > 99 ? 99 : pct);  // voltage reads high while charging
+    ESP_LOGI("pmu", "mv=%d stat=%d chrg=%d plugged=%d raw=%d%%", mv, dbg_stat, chrg, (int)plugged, pct);
+    if (plugged) {
+        // The voltage is not a clean battery reading while the charger is running (it jumps with the charge current),
+        // so show the middle of the last 7 samples (about 35 s), and 100% only once "charge done" has been
+        // reported on 3 polls in a row. The bolt shows that it is charging; the number only moves slowly.
+        static int win[7], wn = 0, done_votes = 0;
+        win[wn++ % 7] = pct;
+        int n = wn < 7 ? wn : 7, tmp[7];
+        for (int i = 0; i < n; i++) tmp[i] = win[i];
+        for (int i = 1; i < n; i++) for (int j = i; j > 0 && tmp[j] < tmp[j - 1]; j--) { int t = tmp[j]; tmp[j] = tmp[j - 1]; tmp[j - 1] = t; }
+        done_votes = (chrg == 3) ? done_votes + 1 : 0;
+        pct = done_votes >= 3 ? 100 : (tmp[n / 2] > 99 ? 99 : tmp[n / 2]);
+        if (pct == 100 && done_votes < 3) pct = 99;
+        if (wn > 1000) wn = 7;
+    }
     bool changed = pct != batt.pct || plugged != batt.plugged;
     batt.pct = pct;
     batt.plugged = plugged;
