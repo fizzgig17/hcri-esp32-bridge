@@ -390,7 +390,8 @@ static int approx_percent(int mv) {
 }
 
 static bool was_plugged = false;
-static void was_plugged_reset() { was_plugged = false; }
+static bool full_latch = false;
+static void was_plugged_reset() { was_plugged = false; full_latch = false; }
 
 // Reads the chip; returns true if the displayed values changed.
 static bool battery_poll() {
@@ -414,16 +415,22 @@ static bool battery_poll() {
         // so show the middle of the last 7 samples (about 35 s), and 100% only once "charge done" has been
         // reported on 3 polls in a row. The bolt shows that it is charging; the number only moves slowly.
         static int win[7], wn = 0, done_votes = 0;
-        if (!was_plugged) { wn = 0; done_votes = 0; }       // just plugged in: start a fresh window
+        if (!was_plugged) { wn = 0; done_votes = 0; full_latch = false; }       // just plugged in: start a fresh window
         was_plugged = true;
         win[wn++ % 7] = pct;
         if (wn < 5) return false;                           // too few samples to trust yet: keep the last value
         int n = wn < 7 ? wn : 7, tmp[7];
         for (int i = 0; i < n; i++) tmp[i] = win[i];
         for (int i = 1; i < n; i++) for (int j = i; j > 0 && tmp[j] < tmp[j - 1]; j--) { int t = tmp[j]; tmp[j] = tmp[j - 1]; tmp[j - 1] = t; }
-        done_votes = (chrg == 3) ? done_votes + 1 : 0;
-        pct = done_votes >= 3 ? 100 : (tmp[n / 2] > 99 ? 99 : tmp[n / 2]);
-        if (pct == 100 && done_votes < 3) pct = 99;
+        // Near the top the charger flips between "fast charge" and "done" every few seconds and the voltage
+        // follows it, so "done" is not a steady signal. Count a poll as full when the chip says done OR the
+        // voltage is at the charge target; latch 100% after 3 such polls in a row, and keep it until the
+        // middle of the recent readings falls well below full (a real discharge) or the charger is removed.
+        bool near_full = (chrg == 3) || mv >= 4190;
+        done_votes = near_full ? done_votes + 1 : 0;
+        if (done_votes >= 3) full_latch = true;
+        if (tmp[n / 2] < 85) full_latch = false;
+        pct = full_latch ? 100 : (tmp[n / 2] > 99 ? 99 : tmp[n / 2]);
         if (wn > 1000) wn = 7;
     }
     if (!plugged) was_plugged_reset();
