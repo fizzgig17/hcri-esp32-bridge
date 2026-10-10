@@ -334,17 +334,25 @@ static bool pmu_write(uint8_t reg, uint8_t v) {
 #define PRO_OTG_BOOST 1
 #endif
 static bool otg_on = false;
+// Last power-chip readings, shown on the "NO USB" screen so a dropout can be diagnosed without a laptop.
+static int dbg_mv = 0, dbg_stat = -1, dbg_fault = -1, dbg_chrg = -1;
+static int unplug_votes = 0;
 static void otg_update(bool plugged) {
 #if PRO_OTG_BOOST
     uint8_t r03;
     if (!pmu_read(0x03, &r03)) return;
-    bool want = !plugged;
+    // Turning the boost OFF cuts the spectrometer's power, so it takes several polls in a row that say
+    // "outside power is present" (a single odd status read must not drop the USB device). Turning it ON is immediate.
+    unplug_votes = plugged ? unplug_votes + 1 : 0;
+    bool want = !(plugged && (unplug_votes >= 3 || !otg_on));
     if (want && !(r03 & 0x20)) {
         pmu_write(0x03, (uint8_t)((r03 | 0x20) & ~0x10));   // OTG_CONFIG on, CHG_CONFIG off
         otg_on = true;
+        ESP_LOGW("pmu", "boost ON");
     } else if (!want && (r03 & 0x20)) {
         pmu_write(0x03, (uint8_t)((r03 & ~0x20) | 0x10));   // boost off, charging back on
         otg_on = false;
+        ESP_LOGW("pmu", "boost OFF (outside power seen %d polls)", unplug_votes);
     }
 #else
     (void)plugged;
@@ -381,6 +389,10 @@ static int approx_percent(int mv) {
     return 100;
 }
 
+static bool was_plugged = false;
+static bool full_latch = false;
+static void was_plugged_reset() { was_plugged = false; full_latch = false; }
+
 // Reads the chip; returns true if the displayed values changed.
 static bool battery_poll() {
     uint8_t r02 = 0, r0b = 0, r0e = 0, r11 = 0;
@@ -388,12 +400,40 @@ static bool battery_poll() {
     if (!(r02 & 0x40)) pmu_write(0x02, r02 | 0x40);   // keep the ADC converting continuously
     int mv = 2304 + (r0e & 0x7F) * 20;                // REG0E: battery voltage, 20 mV steps
     if (mv < 2500) return false;                      // ADC hasn't produced a value yet
+    uint8_t r0c = 0;
+    pmu_read(0x0C, &r0c);                              // REG0C: fault flags (boost overload, battery, thermal)
+    dbg_mv = mv; dbg_stat = (r0b >> 5) & 7; dbg_chrg = (r0b >> 3) & 3; dbg_fault = r0c;
+    if (r0c) ESP_LOGW("pmu", "fault REG0C=0x%02x stat=%d mv=%d", r0c, dbg_stat, mv);
     bool boosting = ((r0b >> 5) & 7) == 7;            // REG0B VBUS_STAT 7: the chip itself is sourcing 5 V
     bool plugged = (r11 & 0x80) != 0 && !boosting;    // REG11 bit 7: VBUS good (outside power)
     otg_update(plugged);
     int chrg = (r0b >> 3) & 3;                        // REG0B: 0 idle, 1 pre-charge, 2 fast charge, 3 done
     int pct = approx_percent(mv);
-    if (plugged) pct = (chrg == 3) ? 100 : (pct > 99 ? 99 : pct);  // voltage reads high while charging
+    ESP_LOGI("pmu", "mv=%d stat=%d chrg=%d plugged=%d raw=%d%%", mv, dbg_stat, chrg, (int)plugged, pct);
+    if (plugged) {
+        // The voltage is not a clean battery reading while the charger is running (it jumps with the charge current),
+        // so show the middle of the last 7 samples (about 35 s), and 100% only once "charge done" has been
+        // reported on 3 polls in a row. The bolt shows that it is charging; the number only moves slowly.
+        static int win[7], wn = 0, done_votes = 0;
+        if (!was_plugged) { wn = 0; done_votes = 0; full_latch = false; }       // just plugged in: start a fresh window
+        was_plugged = true;
+        win[wn++ % 7] = pct;
+        if (wn < 5) return false;                           // too few samples to trust yet: keep the last value
+        int n = wn < 7 ? wn : 7, tmp[7];
+        for (int i = 0; i < n; i++) tmp[i] = win[i];
+        for (int i = 1; i < n; i++) for (int j = i; j > 0 && tmp[j] < tmp[j - 1]; j--) { int t = tmp[j]; tmp[j] = tmp[j - 1]; tmp[j - 1] = t; }
+        // Near the top the charger flips between "fast charge" and "done" every few seconds and the voltage
+        // follows it, so "done" is not a steady signal. Count a poll as full when the chip says done OR the
+        // voltage is at the charge target; latch 100% after 3 such polls in a row, and keep it until the
+        // middle of the recent readings falls well below full (a real discharge) or the charger is removed.
+        bool near_full = (chrg == 3) || mv >= 4190;
+        done_votes = near_full ? done_votes + 1 : 0;
+        if (done_votes >= 3) full_latch = true;
+        if (tmp[n / 2] < 85) full_latch = false;
+        pct = full_latch ? 100 : (tmp[n / 2] > 99 ? 99 : tmp[n / 2]);
+        if (wn > 1000) wn = 7;
+    }
+    if (!plugged) was_plugged_reset();
     bool changed = pct != batt.pct || plugged != batt.plugged;
     batt.pct = pct;
     batt.plugged = plugged;
@@ -431,21 +471,33 @@ static void draw_battery() {
     text(x, 4, b, 2, col);
 }
 
+// Power-chip state line on the idle screens (NO USB / READY): input status, charge state, fault flags, battery mV.
+static bool diag_on = false;
+static void draw_diag() {
+    fill(0, 134, W, 20, BLACK);
+    if (dbg_stat < 0) return;
+    char d[40];
+    snprintf(d, sizeof d, "S%d C%d F%02X %dmV", dbg_stat, dbg_chrg, dbg_fault, dbg_mv);
+    text(20, 140, d, 2, GREY);
+}
+
 // Called from the idle loops: refresh the indicator (at most every 5 s) and redraw if it changed.
 static void battery_tick() {
     static int64_t last = -5000000;
     int64_t now = esp_timer_get_time();
     if (now - last < 5000000) return;
     last = now;
-    if (battery_poll()) {
-        draw_battery();
-        present();
-    }
+    bool ch = battery_poll();
+    if (ch) draw_battery();
+    if (diag_on) draw_diag();
+    if (ch || diag_on) present();
 }
 #else
 static void battery_init() {}
 static void draw_battery() {}
 static void battery_tick() {}
+static bool diag_on = false;
+static void draw_diag() {}
 #endif
 
 // ----------------------------------------------------------- USB serial ----
@@ -895,6 +947,8 @@ static void ui_waiting() {
     header("NO USB", RED);
     text(20, 70, "PLUG IN SPECTROMETER", 2, YELLOW);
     text(20, 100, "VIA OTG CABLE", 2, GREY);
+    diag_on = true;
+    draw_diag();
     present();
 }
 
@@ -904,10 +958,13 @@ static void ui_ready() {
     text(6, 32, device_id, 1, GREY);
     textf(6, 48, 1, GREY, "RANGE %d-%d NM", range_lo, range_hi);
     text(20, 90, "PRESS BUTTON TO SCAN", 2, WHITE);
+    diag_on = true;
+    draw_diag();
     present();
 }
 
 static void ui_progress(int tries, float exp_ms, int status) {
+    diag_on = false;
     ble_status(1, (uint8_t)tries, exp_ms);
     clear();
     header("SCANNING", YELLOW);
@@ -921,6 +978,7 @@ static void ui_progress(int tries, float exp_ms, int status) {
 static void ui_scanning() { ui_progress(0, 0, 2); }
 
 static void ui_result(bool ok) {
+    diag_on = false;
     int n = scan.npts;
     Stats t = stats_of(scan);
     float mx = t.mx;
