@@ -389,6 +389,9 @@ static int approx_percent(int mv) {
     return 100;
 }
 
+static bool was_plugged = false;
+static void was_plugged_reset() { was_plugged = false; }
+
 // Reads the chip; returns true if the displayed values changed.
 static bool battery_poll() {
     uint8_t r02 = 0, r0b = 0, r0e = 0, r11 = 0;
@@ -411,7 +414,10 @@ static bool battery_poll() {
         // so show the middle of the last 7 samples (about 35 s), and 100% only once "charge done" has been
         // reported on 3 polls in a row. The bolt shows that it is charging; the number only moves slowly.
         static int win[7], wn = 0, done_votes = 0;
+        if (!was_plugged) { wn = 0; done_votes = 0; }       // just plugged in: start a fresh window
+        was_plugged = true;
         win[wn++ % 7] = pct;
+        if (wn < 5) return false;                           // too few samples to trust yet: keep the last value
         int n = wn < 7 ? wn : 7, tmp[7];
         for (int i = 0; i < n; i++) tmp[i] = win[i];
         for (int i = 1; i < n; i++) for (int j = i; j > 0 && tmp[j] < tmp[j - 1]; j--) { int t = tmp[j]; tmp[j] = tmp[j - 1]; tmp[j - 1] = t; }
@@ -420,6 +426,7 @@ static bool battery_poll() {
         if (pct == 100 && done_votes < 3) pct = 99;
         if (wn > 1000) wn = 7;
     }
+    if (!plugged) was_plugged_reset();
     bool changed = pct != batt.pct || plugged != batt.plugged;
     batt.pct = pct;
     batt.plugged = plugged;
