@@ -334,17 +334,25 @@ static bool pmu_write(uint8_t reg, uint8_t v) {
 #define PRO_OTG_BOOST 1
 #endif
 static bool otg_on = false;
+// Last power-chip readings, shown on the "NO USB" screen so a dropout can be diagnosed without a laptop.
+static int dbg_mv = 0, dbg_stat = -1, dbg_fault = -1, dbg_chrg = -1;
+static int unplug_votes = 0;
 static void otg_update(bool plugged) {
 #if PRO_OTG_BOOST
     uint8_t r03;
     if (!pmu_read(0x03, &r03)) return;
-    bool want = !plugged;
+    // Turning the boost OFF cuts the spectrometer's power, so it takes several polls in a row that say
+    // "outside power is present" (a single odd status read must not drop the USB device). Turning it ON is immediate.
+    unplug_votes = plugged ? unplug_votes + 1 : 0;
+    bool want = !(plugged && (unplug_votes >= 3 || !otg_on));
     if (want && !(r03 & 0x20)) {
         pmu_write(0x03, (uint8_t)((r03 | 0x20) & ~0x10));   // OTG_CONFIG on, CHG_CONFIG off
         otg_on = true;
+        ESP_LOGW("pmu", "boost ON");
     } else if (!want && (r03 & 0x20)) {
         pmu_write(0x03, (uint8_t)((r03 & ~0x20) | 0x10));   // boost off, charging back on
         otg_on = false;
+        ESP_LOGW("pmu", "boost OFF (outside power seen %d polls)", unplug_votes);
     }
 #else
     (void)plugged;
@@ -388,6 +396,10 @@ static bool battery_poll() {
     if (!(r02 & 0x40)) pmu_write(0x02, r02 | 0x40);   // keep the ADC converting continuously
     int mv = 2304 + (r0e & 0x7F) * 20;                // REG0E: battery voltage, 20 mV steps
     if (mv < 2500) return false;                      // ADC hasn't produced a value yet
+    uint8_t r0c = 0;
+    pmu_read(0x0C, &r0c);                              // REG0C: fault flags (boost overload, battery, thermal)
+    dbg_mv = mv; dbg_stat = (r0b >> 5) & 7; dbg_chrg = (r0b >> 3) & 3; dbg_fault = r0c;
+    if (r0c) ESP_LOGW("pmu", "fault REG0C=0x%02x stat=%d mv=%d", r0c, dbg_stat, mv);
     bool boosting = ((r0b >> 5) & 7) == 7;            // REG0B VBUS_STAT 7: the chip itself is sourcing 5 V
     bool plugged = (r11 & 0x80) != 0 && !boosting;    // REG11 bit 7: VBUS good (outside power)
     otg_update(plugged);
@@ -895,6 +907,13 @@ static void ui_waiting() {
     header("NO USB", RED);
     text(20, 70, "PLUG IN SPECTROMETER", 2, YELLOW);
     text(20, 100, "VIA OTG CABLE", 2, GREY);
+#ifdef BOARD_PRO
+    if (dbg_stat >= 0) {   // power-chip state at the last poll: input status, charge state, fault flags, battery mV
+        char d[40];
+        snprintf(d, sizeof d, "S%d C%d F%02X %dmV", dbg_stat, dbg_chrg, dbg_fault, dbg_mv);
+        text(20, 140, d, 2, GREY);
+    }
+#endif
     present();
 }
 
