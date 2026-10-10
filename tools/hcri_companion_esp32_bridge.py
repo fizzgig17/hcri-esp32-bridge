@@ -117,8 +117,11 @@ def probe(port):
     info = {"raw": out}
     for line in out.splitlines():
         line = line.strip()
+        # esptool 4 prints "Chip is ESP32-S3 (...)"; esptool 5 prints "Chip type:  ESP32-S3 (...)".
         if line.startswith("Chip is "):
             info["chip"] = line[len("Chip is "):]
+        elif line.startswith("Chip type:"):
+            info["chip"] = line[len("Chip type:"):].strip()
         elif line.startswith("Features:"):
             info["features"] = line[len("Features:"):].strip()
         elif line.startswith("MAC:"):
