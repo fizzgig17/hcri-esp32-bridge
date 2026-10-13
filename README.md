@@ -1,4 +1,10 @@
-# Torch Bearer scanner (T-Display S3)
+# hCRI ESP32 bridge (T-Display S3): Torch Bearer and ColorMunki
+
+Step-by-step setup guide with buying links: <https://www.hcri.io/companion/bridge/>
+
+The same firmware drives a **Torch Bearer** (CH340 serial) or an **X-Rite ColorMunki Photo / Design** (USB 0971:2007) and
+auto-detects which is plugged in. The ColorMunki is measured in ambient mode only, after a dark calibration (dial in the
+calibration position); the app can require recalibration after a set time (Settings, default 1 h).
 
 Press the right button (GPIO14) or BOOT: the board asks the Torch Bearer for one
 auto-exposure scan over USB (CH340 serial, 115200 8N1) and shows peak wavelength,
@@ -8,7 +14,7 @@ peak value, sum, exposure and a spectrum plot. GPLv3 (derived from Torch-Bearer-
 
 For use with the hCRI Companion app (Android and iPhone):
 
-- **Torch Bearer spectrometer** (the thing being bridged).
+- **Torch Bearer spectrometer** or **ColorMunki Photo / Design** (the thing being bridged). ColorMunki Display/Smile are not supported.
 - **LilyGO T-Display S3**, the standard non-Pro version with 16 MB flash. It is the bridge: it talks
   USB to the spectrometer and Bluetooth LE to your phone.
 - **USB cable/adapter set**: a USB-C male OTG cable or adapter that gives you a female USB-A
@@ -21,6 +27,7 @@ For use with the hCRI Companion app (Android and iPhone):
   While outside power is connected the 5 V output is off and the battery charges as usual; the
   battery does not charge while it is powering the Torch Bearer. This feature is untested on
   hardware (compile it out with `-DPRO_OTG_BOOST=0`).
+- With a ColorMunki on the standard T-Display S3, power it from a power bank (it draws more current than the Torch Bearer). The Pro can run it from its battery.
 - **Phone** with the hCRI Companion app: Android 7.0+ or iPhone with iOS 15.1+, with Bluetooth LE.
 - Optional: a diffuser in front of the lamp; about 25 cm distance works well.
 
@@ -119,3 +126,6 @@ Test with nRF Connect: connect, subscribe to result + status, write 01 to the co
 ## Licence
 
 GPLv3 (see `LICENSE`), derived from Torch-Bearer-Tools / tobes-ui. Copyright fizzgig.
+
+`src/munki_argyll.cpp` and `src/munki_argyll.h` are ported from ArgyllCMS and remain under the **AGPL-3.0**
+(<https://www.argyllcms.com>); the combined firmware is distributed under terms compatible with both licences.
