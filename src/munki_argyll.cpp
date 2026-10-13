@@ -4,6 +4,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -38,7 +40,7 @@ static bool ctrl(bool in, uint8_t req, uint8_t *buf, int len, int timeout_ms = 2
     const int mps = 64;
     int data_len = in ? ((len + mps - 1) / mps) * mps : len;
     usb_transfer_t *t = NULL;
-    if (usb_host_transfer_alloc(sizeof(usb_setup_packet_t) + data_len, 0, &t) != ESP_OK) return false;
+    if (usb_host_transfer_alloc(sizeof(usb_setup_packet_t) + data_len, 0, &t) != ESP_OK) { set_err("NO CTRL BUFFER"); return false; }
     usb_setup_packet_t *s = (usb_setup_packet_t *)t->data_buffer;
     s->bmRequestType = (in ? 0x80 : 0x00) | 0x40;   // vendor, device
     s->bRequest = req;
@@ -58,21 +60,34 @@ static bool ctrl(bool in, uint8_t req, uint8_t *buf, int len, int timeout_ms = 2
         pump(w, timeout_ms);
         ok = w.done && w.status == USB_TRANSFER_STATUS_COMPLETED;
         if (ok && in) memcpy(buf, t->data_buffer + sizeof(usb_setup_packet_t), len);
-        if (!ok) ESP_LOGW(TAGM, "request 0x%02X failed (status %d)", req, (int)w.status);
+        if (!ok) set_err("REQ %02X ST %d", req, (int)w.status);
     }
     if (w.done || !ok) usb_host_transfer_free(t);
     return ok;
 }
 
-// Bulk IN read (instrument data comes back on endpoint 0x81).
-static bool bulk_in(uint8_t *buf, int len, int timeout_ms) {
+static char g_err[48] = "";
+const char *last_error() { return g_err; }
+static void set_err(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(g_err, sizeof g_err, fmt, ap);
+    va_end(ap);
+    ESP_LOGW(TAGM, "%s", g_err);
+}
+
+// Bulk IN read (instrument data comes back on endpoint 0x81), handed to `sink` one transfer at a time so nothing larger
+// than a single 4 KB buffer is ever needed (the bridge runs Bluetooth too and has little free RAM for a 40 KB buffer).
+// Every transfer is a multiple of 64 bytes except possibly the last, so the stream stays aligned with the instrument.
+typedef bool (*SinkFn)(const uint8_t *d, int n, void *ctx);
+static bool bulk_in_stream(int total, int timeout_ms, SinkFn sink, void *ctx) {
+    usb_transfer_t *t = NULL;
+    if (usb_host_transfer_alloc(4096, 0, &t) != ESP_OK) { set_err("NO USB BUFFER"); return false; }
+    bool ok = true, pending = false;
     int off = 0;
-    while (off < len) {
-        int chunk = len - off;
-        if (chunk > 4096) chunk = 4096;
+    while (ok && off < total) {
+        int chunk = total - off < 4096 ? total - off : 4096;
         int alloc = ((chunk + 63) / 64) * 64;
-        usb_transfer_t *t = NULL;
-        if (usb_host_transfer_alloc(alloc, 0, &t) != ESP_OK) return false;
         Wait w = {false, USB_TRANSFER_STATUS_ERROR, 0};
         t->device_handle = g_dev;
         t->bEndpointAddress = 0x81;
@@ -80,17 +95,20 @@ static bool bulk_in(uint8_t *buf, int len, int timeout_ms) {
         t->callback = xfer_cb;
         t->context = &w;
         t->timeout_ms = timeout_ms;
-        bool ok = false;
-        if (usb_host_transfer_submit(t) == ESP_OK) {
-            pump(w, timeout_ms);
-            ok = w.done && w.status == USB_TRANSFER_STATUS_COMPLETED && w.bytes >= chunk;
-            if (ok) memcpy(buf + off, t->data_buffer, chunk);
+        esp_err_t e = usb_host_transfer_submit(t);
+        if (e != ESP_OK) { set_err("BULK SUBMIT %d", (int)e); ok = false; break; }
+        pump(w, timeout_ms);
+        if (!w.done) { set_err("BULK TIMEOUT"); pending = true; ok = false; break; }
+        if (w.status != USB_TRANSFER_STATUS_COMPLETED || w.bytes < chunk) {
+            set_err("BULK ST %d GOT %d/%d", (int)w.status, w.bytes, chunk);
+            ok = false;
+            break;
         }
-        if (w.done || !ok) usb_host_transfer_free(t);
-        if (!ok) return false;
+        ok = sink(t->data_buffer, chunk, ctx);
         off += chunk;
     }
-    return true;
+    if (!pending) usb_host_transfer_free(t);   // a transfer still in flight must not be freed under the USB stack
+    return ok;
 }
 
 static int buf2int(const uint8_t *b) {   // little endian, signed 32 bit
@@ -154,7 +172,13 @@ bool read_eeprom(uint8_t *buf, int addr, int size) {
     int2buf(&p[0], addr);
     int2buf(&p[4], size);
     if (!ctrl(false, 0x81, p, 8)) return false;
-    return bulk_in(buf, size, 6000);
+    struct Cp { uint8_t *b; int off; } cp = {buf, 0};
+    return bulk_in_stream(size, 6000, [](const uint8_t *d, int n, void *ctx) {
+        Cp *x = (Cp *)ctx;
+        memcpy(x->b + x->off, d, n);
+        x->off += n;
+        return true;
+    }, &cp);
 }
 
 static uint8_t *g_cal = NULL;
@@ -220,9 +244,49 @@ bool get_params(Params *p) {
 // (the last is the LED temperature value).
 static const int NSEN = 137, NRAW = 128, RDBYTES = 274;
 
+namespace {
+struct RawAcc {
+    int ninvalid;
+    int idx;                 // readings seen so far
+    uint8_t carry[274];
+    int carry_len;
+    double acc[128];
+    double shielded, led;
+    int counted;
+};
+}
+
+static void take_reading(RawAcc *a, const uint8_t *r) {
+    if (a->idx++ < a->ninvalid) return;
+    for (int k = 0; k < 4; k++) a->shielded += u16at(r, k * 2);
+    for (int j = 0; j < 128; j++) a->acc[j] += u16at(r, (6 + j) * 2);
+    a->led += u16at(r, (137 - 1) * 2);
+    a->counted++;
+}
+
+static bool raw_sink(const uint8_t *d, int n, void *ctx) {
+    RawAcc *a = (RawAcc *)ctx;
+    while (n > 0) {
+        if (a->carry_len > 0 || n < 274) {
+            int need = 274 - a->carry_len;
+            int take = n < need ? n : need;
+            memcpy(a->carry + a->carry_len, d, take);
+            a->carry_len += take;
+            d += take;
+            n -= take;
+            if (a->carry_len == 274) { take_reading(a, a->carry); a->carry_len = 0; }
+        } else {
+            take_reading(a, d);
+            d += 274;
+            n -= 274;
+        }
+    }
+    return true;
+}
+
 bool measure_raw(bool lamp, double inttime_s, int ninvalid, int nmeas, Raw *out) {
     Params pr;
-    if (!get_params(&pr) || nmeas < 1 || ninvalid < 0) return false;
+    if (!get_params(&pr) || nmeas < 1 || ninvalid < 0) { set_err("NO PARAMS"); return false; }
     int total = ninvalid + nmeas;
     int intclocks = (int)(inttime_s / pr.tick_s + 0.5);
     uint8_t cmd[12] = {};
@@ -233,34 +297,24 @@ bool measure_raw(bool lamp, double inttime_s, int ninvalid, int nmeas, Raw *out)
     int2buf(&cmd[4], intclocks);
     int2buf(&cmd[8], total);
     if (!ctrl(false, 0x80, cmd, 12)) return false;
-    size_t bytes = (size_t)RDBYTES * total;
-    uint8_t *buf = (uint8_t *)malloc(bytes);
-    if (!buf) return false;
+    RawAcc a = {};
+    a.ninvalid = ninvalid;
     int timeout = 2000 + (int)(inttime_s * total * 1000.0);
-    bool ok = bulk_in(buf, (int)bytes, timeout);
-    if (ok) {
-        memset(out, 0, sizeof *out);
-        double acc[NRAW] = {};
-        for (int i = ninvalid; i < total; i++) {
-            const uint8_t *r = buf + (size_t)i * RDBYTES;
-            for (int k = 0; k < 4; k++) out->shielded += u16at(r, k * 2);
-            for (int j = 0; j < NRAW; j++) acc[j] += u16at(r, (6 + j) * 2);
-            out->led += u16at(r, (NSEN - 1) * 2);
-        }
-        out->n = nmeas;
-        out->shielded /= 4.0 * nmeas;
-        out->led /= nmeas;
-        double sum = 0, mx = 0;
-        for (int j = 0; j < NRAW; j++) {
-            out->band[j] = (float)(acc[j] / nmeas);
-            sum += out->band[j];
-            if (out->band[j] > mx) mx = out->band[j];
-        }
-        out->mean = sum / NRAW;
-        out->max = mx;
+    if (!bulk_in_stream(274 * total, timeout, raw_sink, &a)) return false;
+    if (a.counted != nmeas) { set_err("GOT %d OF %d READINGS", a.counted, nmeas); return false; }
+    memset(out, 0, sizeof *out);
+    out->n = nmeas;
+    out->shielded = a.shielded / (4.0 * nmeas);
+    out->led = a.led / nmeas;
+    double sum = 0, mx = 0;
+    for (int j = 0; j < 128; j++) {
+        out->band[j] = (float)(a.acc[j] / nmeas);
+        sum += out->band[j];
+        if (out->band[j] > mx) mx = out->band[j];
     }
-    free(buf);
-    return ok;
+    out->mean = sum / 128;
+    out->max = mx;
+    return true;
 }
 
 // ----------------------------------------------------------------------------------------------------------

@@ -80,6 +80,8 @@ bool dark_valid();
 // Dial must already be on the matching position. MR_LOW_LIGHT still returns a usable spectrum.
 Result measure_spectrum(Mode mode, Spectrum *out);
 const char *result_name(Result r);
+// A short code for the last failure ("REQ 80 ST 3", "BULK TIMEOUT"...), to show on the board when something does not work.
+const char *last_error();
 
 const char *pos_name(uint8_t spos);
 

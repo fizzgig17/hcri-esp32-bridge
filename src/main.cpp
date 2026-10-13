@@ -1571,7 +1571,7 @@ static usb_device_handle_t mk_dev = NULL;
 static volatile uint8_t mk_pending[4] = {0, 0, 0, 0};
 static volatile bool mk_gone = false;
 static uint8_t mk_dial = 0xFF;
-enum : uint8_t { MKR_TOO_BRIGHT = 1, MKR_COMMS = 2, MKR_NO_DARK = 3, MKR_NO_DATA = 4, MKR_WRONG_DIAL = 5 };
+enum : uint8_t { MKR_TOO_BRIGHT = 1, MKR_COMMS = 2, MKR_NO_DARK = 3, MKR_NO_DATA = 4, MKR_WRONG_DIAL = 5, MKR_CAL_FAILED = 6 };
 static uint8_t mk_reason = 0;
 static const char *mk_msg = "";
 
@@ -1682,6 +1682,10 @@ static void mk_fail(uint8_t reason, const char *msg) {
     mk_msg = msg;
     ble_status(5, reason, 0);
     ui_munki_ready();
+    // Let the phone see the failure, then go back to ready so a later
+    // connection does not start out reading a stale error.
+    vTaskDelay(pdMS_TO_TICKS(300));
+    ble_status(0, 0, 0);
 }
 
 static void mk_do(uint8_t dial) {
@@ -1692,7 +1696,7 @@ static void mk_do(uint8_t dial) {
         bool ok = munki::dark_calibrate();
         mk_dial = dial;
         meter_flags = mk_flags_now();
-        if (!ok) { mk_fail(MKR_COMMS, "CALIBRATION FAILED"); return; }
+        if (!ok) { mk_fail(MKR_CAL_FAILED, munki::last_error()); return; }
         ble_status(0, 0, 0);
         ui_munki_ready();
     } else if (dial == munki::POS_AMBIENT) {
@@ -1709,7 +1713,7 @@ static void mk_do(uint8_t dial) {
             ble_send_result();
         } else if (r == munki::MR_TOO_BRIGHT) mk_fail(MKR_TOO_BRIGHT, "TOO BRIGHT");
         else if (r == munki::MR_NO_DARK) mk_fail(MKR_NO_DARK, "CALIBRATE FIRST (DIAL TO CALIBRATION)");
-        else if (r == munki::MR_COMMS) mk_fail(MKR_COMMS, "INSTRUMENT NOT ANSWERING");
+        else if (r == munki::MR_COMMS) mk_fail(MKR_COMMS, munki::last_error());
         else mk_fail(MKR_NO_DATA, "MEASUREMENT FAILED");
     } else {
         mk_fail(MKR_WRONG_DIAL, "SET THE DIAL TO AMBIENT (OR CALIBRATION)");
