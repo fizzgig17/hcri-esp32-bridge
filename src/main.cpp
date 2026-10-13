@@ -74,9 +74,8 @@ static const char *FW_VERSION = FW_STR(FW_GIT);
 #define PIN_SD_CS     14   // shares the SPI bus; keep it deselected
 #define PIN_I2C_SDA   5
 #define PIN_I2C_SCL   6
-#define PIN_BTN_A     0    // BOOT, on the left edge
-#define PIN_BTN_B     12   // user button 2, right edge (top)
-#define PIN_BTN_C     16   // user button 3, right edge (bottom)
+#define PIN_BTN_A     0    // BOOT
+#define PIN_BTN_B     12   // user button 2
 #else
 #define PIN_POWER_ON 15
 #define PIN_LCD_BL   38
@@ -1023,47 +1022,39 @@ static void link_tick() {
 }
 
 // ----------------------------------------------------------------- UI ----
-// Small yellow arrows pointing at the scan buttons on the READY and result screens.
-// T-Display S3: the buttons are on one side, so one arrow: unflipped bottom-left pointing left, flipped top-right pointing
-// right. T-Display-S3 Pro: buttons sit on both ends of the board, so there is an arrow at both: bottom-left pointing
-// down and top-right pointing up (flipping just swaps which end is which).
-#ifdef BOARD_PRO
-static inline bool arrow_top_right() { return true; }
-static inline bool arrow_bottom_left() { return true; }
-#else
-static inline bool arrow_top_right() { return flipped; }
-static inline bool arrow_bottom_left() { return !flipped; }
-#endif
+// A small yellow arrow pointing at the scan button on the READY and result screens. Unflipped, the buttons are at the
+// bottom-left on both boards: S3 arrow bottom-left pointing left, Pro arrow bottom-left pointing down. Flipped, they are
+// at the top-right: S3 arrow pointing right, Pro arrow pointing up.
+static inline bool arrow_bottom_left() { return !flipped; }   // both boards now start with the buttons at the bottom-left
 
 static void draw_btn_arrow() {
-    if (arrow_top_right()) {
 #ifdef BOARD_PRO
+    if (!arrow_bottom_left()) {
         const int cx = 312;
         for (int i = 0; i <= 5; i++) fill(cx - i, 3 + i, 2 * i + 1, 1, YELLOW);   // head, tip at the top
         fill(cx - 1, 9, 3, 8, YELLOW);                                              // shaft
-#else
-        const int tip = 318, cy = 11;
-        for (int i = 0; i <= 5; i++) fill(tip - i, cy - i, 1, 2 * i + 1, YELLOW);   // head, pointing right
-        fill(tip - 13, cy - 1, 8, 3, YELLOW);                                        // shaft
-#endif
-    }
-    if (arrow_bottom_left()) {
-#ifdef BOARD_PRO
+    } else {
         const int cx = 8;
         for (int i = 0; i <= 5; i++) fill(cx - i, 166 - i, 2 * i + 1, 1, YELLOW); // head, tip at the bottom
         fill(cx - 1, 153, 3, 8, YELLOW);
+    }
 #else
+    if (!arrow_bottom_left()) {
+        const int tip = 318, cy = 11;
+        for (int i = 0; i <= 5; i++) fill(tip - i, cy - i, 1, 2 * i + 1, YELLOW);   // head, pointing right
+        fill(tip - 13, cy - 1, 8, 3, YELLOW);                                        // shaft
+    } else {
         const int tip = 1, cy = 160;
         for (int i = 0; i <= 5; i++) fill(tip + i, cy - i, 1, 2 * i + 1, YELLOW);   // head, pointing left
         fill(tip + 6, cy - 1, 8, 3, YELLOW);
-#endif
     }
+#endif
 }
 
 static void header(const char *right, uint16_t rc) {
     text(6, 4, "TORCH BEARER", 2, WHITE);
     // On the arrow screens the upright arrow owns the top-right corner, so the right-hand status steps left of it.
-    int edge = (shown != 0 && arrow_top_right()) ? W - 24 : W - 6;
+    int edge = (shown != 0 && !arrow_bottom_left()) ? W - 24 : W - 6;
     text(edge - (int)strlen(right) * 12, 4, right, 2, rc);
     draw_battery();
     for (int x = 0; x < W; x++) px(x, 22, GREY);
@@ -1173,13 +1164,8 @@ static void flip_tick() {
     else present();
 }
 
-// Any button, or several at once, starts a scan.
 static bool button_pressed() {
-    bool p = gpio_get_level((gpio_num_t)PIN_BTN_A) == 0 || gpio_get_level((gpio_num_t)PIN_BTN_B) == 0;
-#ifdef PIN_BTN_C
-    p = p || gpio_get_level((gpio_num_t)PIN_BTN_C) == 0;
-#endif
-    return p;
+    return gpio_get_level((gpio_num_t)PIN_BTN_A) == 0 || gpio_get_level((gpio_num_t)PIN_BTN_B) == 0;
 }
 
 // -------------------------------------------------------------- main ----
@@ -1188,9 +1174,6 @@ extern "C" void app_main() {
     bi.mode = GPIO_MODE_INPUT;
     bi.pull_up_en = GPIO_PULLUP_ENABLE;
     bi.pin_bit_mask = (1ULL << PIN_BTN_A) | (1ULL << PIN_BTN_B);
-#ifdef PIN_BTN_C
-    bi.pin_bit_mask |= (1ULL << PIN_BTN_C);
-#endif
     gpio_config(&bi);
 
     ESP_LOGI(TAG, "firmware commit %s", FW_VERSION);
