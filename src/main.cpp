@@ -96,6 +96,40 @@ static const int PIN_LCD_D[8] = {39, 40, 41, 42, 45, 46, 47, 48};
 static uint16_t *fb;  // W*H RGB565, byte-swapped for the panel
 static esp_lcd_panel_handle_t panel;
 
+// Display orientation. The default has the text upright with the USB-C end on the right; "flipped" is that turned
+// 180 degrees. It is chosen from the app (BLE command 0x03) and kept in flash so it survives a power cycle.
+static bool nvs_ready = false;
+static void nvs_boot() {
+    if (nvs_ready) return;
+    esp_err_t r = nvs_flash_init();
+    if (r == ESP_ERR_NVS_NO_FREE_PAGES || r == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        nvs_flash_init();
+    }
+    nvs_ready = true;
+}
+static bool flip_load() {
+    nvs_boot();
+    nvs_handle_t h;
+    uint8_t v = 0;
+    if (nvs_open("hcri", NVS_READONLY, &h) == ESP_OK) {
+        nvs_get_u8(h, "flip", &v);
+        nvs_close(h);
+    }
+    return v != 0;
+}
+static void flip_save(bool f) {
+    nvs_boot();
+    nvs_handle_t h;
+    if (nvs_open("hcri", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, "flip", f ? 1 : 0);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+static bool flipped = false;                // what the panel is set to now
+static volatile int8_t flip_req = -1;       // -1 none, else 0/1 asked for by the phone
+
 static inline uint16_t rgb(uint8_t r, uint8_t g, uint8_t b) {
     uint16_t c = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
     return __builtin_bswap16(c);
@@ -118,6 +152,9 @@ static void st_cmd(uint8_t c, const uint8_t *d = nullptr, size_t n = 0) {
     ESP_ERROR_CHECK(esp_lcd_panel_io_tx_param(lcd_io, c, d, n));
 }
 static void st_cmd1(uint8_t c, uint8_t v) { st_cmd(c, &v, 1); }
+
+// MADCTL: 0xA8 = landscape with the USB-C end on the right, 0x68 = turned 180 degrees (the glass is centred, so the column offset is the same).
+static void apply_flip(bool f) { st_cmd1(0x36, f ? 0x68 : 0xA8); }
 
 // Write a w*h block of RGB565 to the landscape position (x, y).
 static void blit(int x, int y, int w, int h, const void *data) {
@@ -178,7 +215,8 @@ static void lcd_init() {
     vTaskDelay(pdMS_TO_TICKS(120));
     st_cmd(0x38);
     st_cmd(0x21);                                  // IPS panel: inversion on
-    st_cmd1(0x36, 0xA8);                           // landscape, turned 180 degrees (MY | MV | BGR) so the USB-C end is on the right (0x68 = the other way up); the glass is centred, so the column offset is the same
+    flipped = flip_load();
+    apply_flip(flipped);                           // landscape (MY | MV | BGR), see apply_flip
     st_cmd(0x29);                                  // display on
 
     fb = (uint16_t *)heap_caps_malloc(W * H * 2, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
@@ -198,6 +236,9 @@ static void present() {
     vTaskDelay(pdMS_TO_TICKS(40));  // let the DMA finish before fb is touched again
 }
 #else
+// Turned 180 degrees = both mirrors swapped.
+static void apply_flip(bool f) { esp_lcd_panel_mirror(panel, !f, f); }
+
 static void lcd_init() {
     gpio_config_t o = {};
     o.mode = GPIO_MODE_OUTPUT;
@@ -240,10 +281,11 @@ static void lcd_init() {
     esp_lcd_panel_init(panel);
     esp_lcd_panel_invert_color(panel, true);
     esp_lcd_panel_swap_xy(panel, true);
-    // Turned 180 degrees from before: the text reads upright with the USB-C end on the RIGHT, so the buttons sit at the
-    // right edge (the READY arrow points up and to the right at the top one). The 35-pixel gap is the same either way
-    // (the 170-pixel-high glass sits centred in the controller's 240 rows).
-    esp_lcd_panel_mirror(panel, true, false);
+    // Default: the text reads upright with the USB-C end on the RIGHT, so the buttons sit at the right edge (the READY
+    // arrow points up and to the right at the top one). The 35-pixel gap is the same either way (the 170-pixel-high
+    // glass sits centred in the controller's 240 rows).
+    flipped = flip_load();
+    apply_flip(flipped);
     esp_lcd_panel_set_gap(panel, 0, 35);
     esp_lcd_panel_disp_on_off(panel, true);
 
@@ -262,7 +304,9 @@ static void present() {
 
 #endif
 
-static void clear() { memset(fb, 0, W * H * 2); }
+static int shown = 0;      // which screen is on show: 1 READY, 2 result (both carry the button arrow); 0 any other
+static bool result_ok = true;  // the result screen's "ok", to redraw it after a flip
+static void clear() { memset(fb, 0, W * H * 2); shown = 0; }
 
 static inline void px(int x, int y, uint16_t c) {
     if (x >= 0 && x < W && y >= 0 && y < H) fb[y * W + x] = c;
@@ -486,7 +530,7 @@ static void draw_battery() {
 // Power-chip state line on the idle screens (NO USB / READY): input status, charge state, fault flags, battery mV.
 static bool diag_on = false;
 static void draw_diag() {
-    fill(0, 134, W, 20, BLACK);
+    fill(0, 134, W, 19, BLACK);   // stops above the flipped button arrow (y 153+)
     if (dbg_stat < 0) return;
     char d[40];
     snprintf(d, sizeof d, "S%d C%d F%02X %dmV", dbg_stat, dbg_chrg, dbg_fault, dbg_mv);
@@ -885,6 +929,10 @@ static int ble_access_cb(uint16_t, uint16_t, struct ble_gatt_access_ctxt *ctxt, 
         if (OS_MBUF_PKTLEN(ctxt->om) >= 1 && os_mbuf_copydata(ctxt->om, 0, 1, &cmd) == 0) {
             if (cmd == 0x01) ble_scan_req = true;
             if (cmd == 0x02) ble_resend_req = true;
+            if (cmd == 0x03) {  // 0x03 <0|1>: display orientation, 1 = turned 180 degrees
+                uint8_t v = 0;
+                if (OS_MBUF_PKTLEN(ctxt->om) >= 2 && os_mbuf_copydata(ctxt->om, 1, 1, &v) == 0) flip_req = v ? 1 : 0;
+            }
         }
         return 0;
     }
@@ -910,11 +958,7 @@ static void ble_host_task(void *) {
     nimble_port_freertos_deinit();
 }
 static void ble_start() {
-    esp_err_t r = nvs_flash_init();
-    if (r == ESP_ERR_NVS_NO_FREE_PAGES || r == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        nvs_flash_erase();
-        nvs_flash_init();
-    }
+    nvs_boot();
     ESP_ERROR_CHECK(nimble_port_init());
     ble_hs_cfg.sync_cb = ble_on_sync;
     ble_svc_gap_init();
@@ -977,9 +1021,25 @@ static void link_tick() {
 }
 
 // ----------------------------------------------------------------- UI ----
+// A small yellow arrow pointing at the scan button: the button is just beyond the top-right corner, or, with the screen
+// flipped, just beyond the bottom-left corner. Drawn on the READY and result screens.
+static void draw_btn_arrow() {
+    if (!flipped) {
+        const int cx = 312;
+        for (int i = 0; i <= 5; i++) fill(cx - i, 3 + i, 2 * i + 1, 1, YELLOW);   // head, tip at the top
+        fill(cx - 1, 9, 3, 8, YELLOW);                                              // shaft
+    } else {
+        const int cx = 8;
+        for (int i = 0; i <= 5; i++) fill(cx - i, 166 - i, 2 * i + 1, 1, YELLOW); // head, tip at the bottom
+        fill(cx - 1, 153, 3, 8, YELLOW);
+    }
+}
+
 static void header(const char *right, uint16_t rc) {
     text(6, 4, "TORCH BEARER", 2, WHITE);
-    text(W - 6 - (int)strlen(right) * 12, 4, right, 2, rc);
+    // On the arrow screens the upright arrow owns the top-right corner, so the right-hand status steps left of it.
+    int edge = (shown != 0 && !flipped) ? W - 24 : W - 6;
+    text(edge - (int)strlen(right) * 12, 4, right, 2, rc);
     draw_battery();
     for (int x = 0; x < W; x++) px(x, 22, GREY);
     draw_app_link();
@@ -998,16 +1058,14 @@ static void ui_waiting() {
 
 static void ui_ready() {
     clear();
+    shown = 1;
     header("READY", GREEN);
     text(6, 32, device_id, 1, GREY);
     textf(6, 48, 1, GREY, "RANGE %d-%d NM", range_lo, range_hi);
     text(20, 84, "PRESS BUTTON", 2, WHITE);
     text(20, 104, "TO SCAN", 2, WHITE);
-    // Arrow up and to the right: the button is just above the top-right corner of the screen.
-    thick_line(196, 120, 280, 36, 4, YELLOW);
-    thick_line(280, 36, 262, 36, 4, YELLOW);
-    thick_line(280, 36, 280, 54, 4, YELLOW);
-    textf(6, 160, 1, GREY, "FW %s", FW_VERSION);
+    draw_btn_arrow();
+    textf(flipped ? 18 : 6, 160, 1, GREY, "FW %s", FW_VERSION);
     diag_on = true;
     draw_diag();
     present();
@@ -1036,6 +1094,8 @@ static void ui_result(bool ok) {
     Metrics m;
     bool have_m = compute_metrics(scan.spd, n, scan.start_nm, &m);
     clear();
+    shown = 2;
+    result_ok = ok;
     header(ok ? "DONE" : "NO LOCK", ok ? GREEN : RED);
 
     // colorimetry, computed on the board from the corrected spectrum
@@ -1066,10 +1126,26 @@ static void ui_result(bool ok) {
         int pkx = pk * (pw - 1) / (n - 1);
         vline(px0 + pkx, py0, py0 + ph, YELLOW);
     }
-    textf(px0, 162, 1, GREY, "%d", range_lo);
+    textf(flipped ? px0 + 8 : px0, 162, 1, GREY, "%d", range_lo);   // steps right of the flipped arrow
+    draw_btn_arrow();
     textf(px0 + pw / 2 - 9, 162, 1, GREY, "%d", (range_lo + range_hi) / 2);
     textf(px0 + pw - 24, 162, 1, GREY, "%d", range_hi);
     present();
+}
+
+// Apply an orientation asked for over BLE: turn the panel, remember it, and redraw the frame buffer the new way up.
+static void flip_tick() {
+    int8_t r = flip_req;
+    if (r < 0) return;
+    flip_req = -1;
+    bool f = r != 0;
+    if (f == flipped) return;
+    flipped = f;
+    apply_flip(f);
+    flip_save(f);
+    if (shown == 1) ui_ready();            // redraw with the arrow in the other corner
+    else if (shown == 2) ui_result(result_ok);
+    else present();
 }
 
 static bool button_pressed() {
@@ -1100,6 +1176,7 @@ extern "C" void app_main() {
             } else {
                 vcp.reset();
                 if (ble_scan_req) { ble_scan_req = false; ble_status(3, 0, 0); }
+                flip_tick();
                 battery_tick();
                 link_tick();
                 vTaskDelay(pdMS_TO_TICKS(500));
@@ -1134,6 +1211,7 @@ extern "C" void app_main() {
                 if (from_button) while (button_pressed()) vTaskDelay(pdMS_TO_TICKS(20));
                 // result stays on screen; the next press or BLE command starts a new scan
             }
+            flip_tick();
             battery_tick();
             link_tick();
             vTaskDelay(pdMS_TO_TICKS(20));
