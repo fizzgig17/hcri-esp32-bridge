@@ -155,7 +155,7 @@ bool read_eeprom(uint8_t *buf, int addr, int size) {
 
 const char *pos_name(uint8_t s) {
     switch (s) {
-        case POS_PROJ: return "BETWEEN";
+        case POS_PROJ: return "PROJECTOR";
         case POS_SURF: return "SURFACE";
         case POS_CALIB: return "CALIBRATION";
         case POS_AMBIENT: return "AMBIENT";
