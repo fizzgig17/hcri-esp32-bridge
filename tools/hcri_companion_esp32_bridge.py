@@ -6,6 +6,13 @@ hCRI Companion ESP32 Bridge -- find the ESP32 on USB, show what it is, download 
     python hcri_companion_esp32_bridge.py --prod     skip the question: production build only
     python hcri_companion_esp32_bridge.py --dev      skip the question: development build
     python hcri_companion_esp32_bridge.py --no-probe skip identifying the board (you pick the firmware)
+    python hcri_companion_esp32_bridge.py --s3       the board is a T-Display S3: no identifying, no choosing
+    python hcri_companion_esp32_bridge.py --s3pro    the board is a T-Display-S3 Pro: same (--pro also works)
+    python hcri_companion_esp32_bridge.py --yes      answer every question with its default, so it just flashes
+
+Hands-off examples:  py hcri_companion_esp32_bridge.py --s3 --prod --yes
+                     py hcri_companion_esp32_bridge.py --s3pro --dev --yes
+Without --prod or --dev, --yes uses the production build.
 
 Needs Python 3.8+ and esptool (the script installs it with pip if it is missing).
 No other setup: it downloads the firmware from this repo's GitHub releases.
@@ -31,8 +38,6 @@ STATE_FILE = os.path.join(os.path.expanduser("~"), ".hcri-companion-esp32-bridge
 FIRMWARE = [
     ("Torch Bearer bridge - T-Display S3", "hcri-esp32-bridge-factory.bin"),
     ("Torch Bearer bridge - T-Display-S3 Pro", "hcri-esp32-bridge-pro-factory.bin"),
-    ("Battery-life tester - T-Display-S3 Pro (V1.1 board)", "battery-test-pro-v1_1.bin"),
-    ("Battery-life tester - T-Display-S3 Pro (older V1.0 board)", "battery-test-pro-v1_0.bin"),
 ]
 # Which release tag(s) hold each asset, in the order they are tried.
 PROBE_ASSET = "board-probe.bin"
@@ -40,14 +45,12 @@ PROBE_TAG = "board-probe-latest"
 BOARD_NAMES = {"pro": "LilyGo T-Display-S3 Pro", "s3": "LilyGo T-Display S3"}
 # Which FIRMWARE entries (by asset name) make sense on each board.
 FOR_BOARD = {
-    "pro": ["hcri-esp32-bridge-pro-factory.bin", "battery-test-pro-v1_1.bin", "battery-test-pro-v1_0.bin"],
+    "pro": ["hcri-esp32-bridge-pro-factory.bin"],
     "s3": ["hcri-esp32-bridge-factory.bin"],
 }
 TAGS = {
     "hcri-esp32-bridge-factory.bin": {"stable": "prod-latest", "dev": "dev-latest"},
     "hcri-esp32-bridge-pro-factory.bin": {"stable": "prod-latest", "dev": "dev-latest"},
-    "battery-test-pro-v1_1.bin": {"stable": "battery-test-pro-latest", "dev": "battery-test-pro-latest"},
-    "battery-test-pro-v1_0.bin": {"stable": "battery-test-pro-latest", "dev": "battery-test-pro-latest"},
     PROBE_ASSET: {"stable": PROBE_TAG, "dev": PROBE_TAG},
 }
 
@@ -76,7 +79,14 @@ def save_state(st):
         pass
 
 
+AUTO_YES = "--yes" in sys.argv or "-y" in sys.argv
+FORCED_KIND = "s3" if "--s3" in sys.argv else ("pro" if ("--s3pro" in sys.argv or "--pro" in sys.argv) else None)
+
+
 def ask(prompt, default=None):
+    if AUTO_YES:
+        print("%s%s  (--yes)" % (prompt, default if default is not None else ""))
+        return default if default is not None else ""
     try:
         v = input(prompt).strip()
     except EOFError:
@@ -335,7 +345,10 @@ def main():
     mac = info.get("mac", "")
     boards = st.setdefault("boards", {})
     kind = boards.get(mac)
-    if kind in BOARD_NAMES:
+    if FORCED_KIND:
+        kind = FORCED_KIND
+        print("\nBoard: %s (from the command line)." % BOARD_NAMES[kind])
+    elif kind in BOARD_NAMES:
         print("\nThis board was identified before: %s." % BOARD_NAMES[kind])
     elif "--no-probe" not in sys.argv:
         print("\nA T-Display S3 and a T-Display-S3 Pro look the same to the chip, so the program can")
@@ -349,6 +362,9 @@ def main():
                     save_state(st)
                 else:
                     kind = None
+            if not kind and AUTO_YES:
+                print("Couldn't identify the board, and --yes means nobody is here to choose. Run again with --s3 or --s3pro.")
+                return 1
             if not kind:
                 print("OK, you'll choose the firmware yourself.")
             # the probe left the port in use / board running: find it again for flashing

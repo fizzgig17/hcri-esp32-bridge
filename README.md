@@ -60,6 +60,9 @@ downloads the right firmware (checksum-verified) and flashes it.
 - **Run it:** install [Python](https://www.python.org/downloads/), plug the board in, then
   `py hcri_companion_esp32_bridge.py` (Windows) or `python3 hcri_companion_esp32_bridge.py`. It installs esptool if needed.
 - Options: `--prod` or `--dev` pick the build without asking, `--no-probe` skips identifying the board.
+  `--s3` or `--s3pro` say which board it is (no test program, no menu), and `--yes` answers every question with its
+  default, so `py hcri_companion_esp32_bridge.py --s3 --prod --yes` flashes with no prompts. The board still has to be in
+  download mode if the bridge firmware is running on it.
 
 ## Flashing a downloaded build
 

@@ -530,7 +530,7 @@ static void draw_battery() {
 // Power-chip state line on the idle screens (NO USB / READY): input status, charge state, fault flags, battery mV.
 static bool diag_on = false;
 static void draw_diag() {
-    fill(0, 134, W, 19, BLACK);   // stops above the flipped button arrow (y 153+)
+    fill(0, 134, W, 19, BLACK);   // stops above the flipped button arrow
     if (dbg_stat < 0) return;
     char d[40];
     snprintf(d, sizeof d, "S%d C%d F%02X %dmV", dbg_stat, dbg_chrg, dbg_fault, dbg_mv);
@@ -1021,17 +1021,17 @@ static void link_tick() {
 }
 
 // ----------------------------------------------------------------- UI ----
-// A small yellow arrow pointing at the scan button: the button is just beyond the top-right corner, or, with the screen
-// flipped, just beyond the bottom-left corner. Drawn on the READY and result screens.
+// A small yellow arrow pointing at the scan button, which is off the right edge, level with the top of the screen; flipped,
+// it is off the left edge, level with the bottom. Drawn on the READY and result screens.
 static void draw_btn_arrow() {
     if (!flipped) {
-        const int cx = 312;
-        for (int i = 0; i <= 5; i++) fill(cx - i, 3 + i, 2 * i + 1, 1, YELLOW);   // head, tip at the top
-        fill(cx - 1, 9, 3, 8, YELLOW);                                              // shaft
+        const int tip = 318, cy = 11;
+        for (int i = 0; i <= 5; i++) fill(tip - i, cy - i, 1, 2 * i + 1, YELLOW);   // head, pointing right
+        fill(tip - 13, cy - 1, 8, 3, YELLOW);                                        // shaft
     } else {
-        const int cx = 8;
-        for (int i = 0; i <= 5; i++) fill(cx - i, 166 - i, 2 * i + 1, 1, YELLOW); // head, tip at the bottom
-        fill(cx - 1, 153, 3, 8, YELLOW);
+        const int tip = 1, cy = 160;
+        for (int i = 0; i <= 5; i++) fill(tip + i, cy - i, 1, 2 * i + 1, YELLOW);   // head, pointing left
+        fill(tip + 6, cy - 1, 8, 3, YELLOW);
     }
 }
 
