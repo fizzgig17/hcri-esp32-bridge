@@ -366,11 +366,11 @@ static bool compute_spectrum(const Raw &r, double T, Mode mode, float *out) {
 
 Result measure_spectrum(Mode mode, Spectrum *out) {
     Params pr;
-    if (!g_cal || !get_params(&pr)) return R_NO_DATA;
-    if (!g_dark.valid) return R_NO_DARK;
-    if (mode == MODE_PROJECTOR && u16at(g_cal, 0) < 5) return R_NO_PROJ;
+    if (!g_cal || !get_params(&pr)) return MR_NO_DATA;
+    if (!g_dark.valid) return MR_NO_DARK;
+    if (mode == MODE_PROJECTOR && u16at(g_cal, 0) < 5) return MR_NO_PROJ;
     Firmware f;
-    if (!get_firmware(&f)) return R_COMMS;
+    if (!get_firmware(&f)) return MR_COMMS;
     double tmin = pr.tick_s * f.min_int_count;
     double T = 0.1;
     double signal = 0;
@@ -378,7 +378,7 @@ Result measure_spectrum(Mode mode, Spectrum *out) {
     Raw r;
     for (int it = 0; it < 5; it++) {
         if (T < tmin) T = tmin;
-        if (!measure_raw(false, T, 0, 1, &r)) return R_COMMS;
+        if (!measure_raw(false, T, 0, 1, &r)) return MR_COMMS;
         double dk[NRAW + 1];
         dark_at(T, dk);
         double S = 0;
@@ -388,7 +388,7 @@ Result measure_spectrum(Mode mode, Spectrum *out) {
         double target = TARG_SCALE * pr.opt_sval;
         double scale = sat ? 0.25 : target / (S < 1.0 ? 1.0 : S);
         ESP_LOGI(TAGM, "trial %d: T %.4f s signal %.0f max %.0f sat %d target %.0f scale %.3f", it, T, S, r.max, sat, target, scale);
-        if (sat && T <= tmin * 1.001) return R_TOO_BRIGHT;
+        if (sat && T <= tmin * 1.001) return MR_TOO_BRIGHT;
         if (!sat && scale > 0.8 && scale < 1.25) break;
         double nt = T * scale;
         if (nt > TARG_MAX_INT) nt = TARG_MAX_INT;
@@ -401,28 +401,28 @@ Result measure_spectrum(Mode mode, Spectrum *out) {
     int n = (int)(READ_TIME / T + 0.5);
     if (n < 1) n = 1;
     if (n > 40) n = 40;
-    if (!measure_raw(false, T, 0, n, &r)) return R_COMMS;
-    if (r.max >= pr.sat_limit * 0.98) return R_TOO_BRIGHT;
+    if (!measure_raw(false, T, 0, n, &r)) return MR_COMMS;
+    if (r.max >= pr.sat_limit * 0.98) return MR_TOO_BRIGHT;
     memset(out, 0, sizeof *out);
-    if (!compute_spectrum(r, T, mode, out->v)) return mode == MODE_PROJECTOR ? R_NO_PROJ : R_NO_DATA;
+    if (!compute_spectrum(r, T, mode, out->v)) return mode == MODE_PROJECTOR ? MR_NO_PROJ : MR_NO_DATA;
     out->inttime = T;
     out->nmeas = n;
     out->signal = signal;
     int pk = 0;
     for (int j = 1; j < 36; j++) if (out->v[j] > out->v[pk]) pk = j;
     out->peak_nm = 380 + pk * 10;
-    return low ? R_LOW_LIGHT : R_OK;
+    return low ? MR_LOW_LIGHT : MR_OK;
 }
 
 const char *result_name(Result r) {
     switch (r) {
-        case R_OK: return "OK";
-        case R_NO_DARK: return "DARK CAL FIRST (DIAL TO CAL)";
-        case R_NO_DATA: return "NO CALIBRATION DATA";
-        case R_COMMS: return "INSTRUMENT NOT ANSWERING";
-        case R_TOO_BRIGHT: return "TOO BRIGHT";
-        case R_LOW_LIGHT: return "LOW LIGHT";
-        case R_NO_PROJ: return "NO PROJECTOR DATA";
+        case MR_OK: return "OK";
+        case MR_NO_DARK: return "DARK CAL FIRST (DIAL TO CAL)";
+        case MR_NO_DATA: return "NO CALIBRATION DATA";
+        case MR_COMMS: return "INSTRUMENT NOT ANSWERING";
+        case MR_TOO_BRIGHT: return "TOO BRIGHT";
+        case MR_LOW_LIGHT: return "LOW LIGHT";
+        case MR_NO_PROJ: return "NO PROJECTOR DATA";
     }
     return "?";
 }

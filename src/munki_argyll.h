@@ -66,7 +66,7 @@ bool measure_raw(bool lamp, double inttime_s, int ninvalid, int nmeas, Raw *out)
 
 // ---- Emission / ambient spectrum (Argyll's adaptive emissive spot measurement, standard resolution) ----
 enum Mode { MODE_AMBIENT, MODE_EMISSION, MODE_PROJECTOR };   // dial: ambient / surface / projector
-enum Result { R_OK = 0, R_NO_DARK, R_NO_DATA, R_COMMS, R_TOO_BRIGHT, R_LOW_LIGHT, R_NO_PROJ };
+enum Result { MR_OK = 0, MR_NO_DARK, MR_NO_DATA, MR_COMMS, MR_TOO_BRIGHT, MR_LOW_LIGHT, MR_NO_PROJ };
 struct Spectrum {
     float v[36];             // 380..730 nm in 10 nm steps, in Argyll's units for the mode
     double inttime;          // integration time used (seconds)
@@ -77,7 +77,7 @@ struct Spectrum {
 // Dark calibration: dial on CALIBRATION. Reads the sensor dark level at two integration times, as Argyll does.
 bool dark_calibrate();
 bool dark_valid();
-// Dial must already be on the matching position. R_LOW_LIGHT still returns a usable spectrum.
+// Dial must already be on the matching position. MR_LOW_LIGHT still returns a usable spectrum.
 Result measure_spectrum(Mode mode, Spectrum *out);
 const char *result_name(Result r);
 

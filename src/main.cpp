@@ -1372,10 +1372,10 @@ static void pr_measure(uint8_t pos) {
     pr_msg = "MEASURING...";
     pr_show();
     munki::Result r = munki::measure_spectrum(mode, &pr_spec);
-    if (r == munki::R_OK || r == munki::R_LOW_LIGHT) {
+    if (r == munki::MR_OK || r == munki::MR_LOW_LIGHT) {
         pr_have_spec = true;
         pr_spec_mode = mode;
-        pr_msg = r == munki::R_LOW_LIGHT ? "LOW LIGHT - RESULT IS NOISY" : "";
+        pr_msg = r == munki::MR_LOW_LIGHT ? "LOW LIGHT - RESULT IS NOISY" : "";
         pr_page = 1;
         ESP_LOGI(TAG, "spectrum %s: T %.3f s n %d peak %d nm", mode_name(mode), pr_spec.inttime, pr_spec.nmeas, pr_spec.peak_nm);
         for (int j = 0; j < 36; j++) ESP_LOGI(TAG, "  %d nm  %g", 380 + j * 10, pr_spec.v[j]);
