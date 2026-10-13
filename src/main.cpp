@@ -1232,6 +1232,7 @@ static bool button_pressed() {
 #error "the ColorMunki probe is for the T-Display-S3 Pro only (env colormunki-probe-pro)"
 #endif
 #include "usb/usb_helpers.h"
+#include "munki_argyll.h"
 
 static usb_host_client_handle_t pr_client = NULL;
 static usb_device_handle_t pr_dev = NULL;
@@ -1313,6 +1314,27 @@ static void pr_describe() {
     }
 }
 
+
+// Talks to the instrument with the Argyll-derived driver (munki_argyll.cpp) and adds what it says to the pages.
+static bool pr_munki = false;
+static uint8_t pr_spos = 0xFF, pr_but = 0;
+static void pr_query() {
+    pr_munki = false;
+    if (!munki::open(pr_client, pr_dev)) { pr_add("MUNKI: COULD NOT CLAIM INTERFACE 0"); return; }
+    munki::Firmware f;
+    if (munki::get_firmware(&f)) {
+        pr_munki = true;
+        pr_add("MUNKI FW %d.%d  TICK %d  MININT %d", f.fw_major, f.fw_minor, f.tick_dur, f.min_int_count);
+        pr_add("EEPROM %d BLOCKS x %d BYTES", f.ee_blocks, f.ee_block_size);
+    } else {
+        pr_add("MUNKI: FIRMWARE REQUEST FAILED");
+    }
+    char v[37];
+    if (munki::get_version(v)) pr_add("VERSION %s", v);
+    uint8_t id[8];
+    if (munki::get_chip_id(id)) pr_add("CHIP %02X-%02X%02X%02X%02X%02X%02X%02X", id[0], id[1], id[2], id[3], id[4], id[5], id[6], id[7]);
+}
+
 static void pr_frame(const char *right, uint16_t rc) {
     clear();
     text(6, 4, "COLORMUNKI PROBE", 2, WHITE);
@@ -1340,6 +1362,7 @@ static void pr_show() {
         if (k >= pr_n) break;
         text(4, 28 + i * 9, pr_txt[k], 1, WHITE);
     }
+    if (pr_munki) textf(4, 148, 1, YELLOW, "DIAL %s  MUNKI BUTTON %s", pr_spos == 0xFF ? "-" : munki::pos_name(pr_spos), pr_but ? "PRESSED" : "-");
     textf(4, 160, 1, GREY, "PAGE %d/%d  BUTTON = NEXT  FW %s", pr_page + 1, pages, FW_VERSION);
     present();
 }
@@ -1374,6 +1397,7 @@ extern "C" void app_main() {
             }
             if (usb_host_device_open(pr_client, addr, &pr_dev) == ESP_OK) {
                 pr_describe();
+                pr_query();
                 pr_page = 0;
                 pr_show();
             } else {
@@ -1384,9 +1408,11 @@ extern "C" void app_main() {
         if (pr_gone) {
             pr_gone = false;
             if (pr_dev) {
+                munki::close();
                 usb_host_device_close(pr_client, pr_dev);
                 pr_dev = NULL;
             }
+            pr_munki = false;
             pr_waiting();
         }
         if (pr_dev && button_pressed()) {
@@ -1395,6 +1421,15 @@ extern "C" void app_main() {
                 pr_page++;
                 pr_show();
                 while (button_pressed()) vTaskDelay(pdMS_TO_TICKS(20));
+            }
+        }
+        if (pr_munki && pr_dev) {   // live dial position and instrument button
+            static uint32_t last = 0;
+            uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            if (now - last >= 300) {
+                last = now;
+                uint8_t sp, bt;
+                if (munki::get_status(&sp, &bt) && (sp != pr_spos || bt != pr_but)) { pr_spos = sp; pr_but = bt; pr_show(); }
             }
         }
         battery_tick();
