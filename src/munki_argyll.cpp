@@ -7,6 +7,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -336,7 +337,9 @@ static void put_dark(float *dst, const Raw &r) {
     for (int j = 0; j < NRAW; j++) dst[1 + j] = r.band[j];
 }
 
+static int64_t g_dark_us = 0;
 bool dark_valid() { return g_dark.valid; }
+uint32_t dark_age_s() { return g_dark.valid ? (uint32_t)((esp_timer_get_time() - g_dark_us) / 1000000) : 0xFFFFFFFFu; }
 
 bool dark_calibrate() {
     Params pr;
@@ -358,6 +361,7 @@ bool dark_calibrate() {
     g_dark.t1 = 2.0;
     put_dark(g_dark.d1, r);
     g_dark.valid = true;
+    g_dark_us = esp_timer_get_time();
     return true;
 }
 

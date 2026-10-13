@@ -797,7 +797,8 @@ static bool have_result = false;
 // State 3 = no spectrometer: that is what a phone must read when it connects before one is plugged in (it becomes 0 'ready' once USB connects).
 // Bytes 6 and 7 are new: [6] meter kind (0 Torch Bearer, 1 ColorMunki), [7] ColorMunki flags: bit7 dial known, bits0-1 dial position
 // (0 projector, 1 surface, 2 calibration, 3 ambient), bit2 dark calibration done. Older apps read only the first 6 bytes.
-static uint8_t last_state[8] = {3};
+static uint8_t last_state[10] = {3, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF};
+static uint16_t (*meter_cal_age_min)() = NULL;   // ColorMunki: minutes since dark calibration (0xFFFF = none)
 static uint8_t meter_kind = 0, meter_flags = 0;
 
 struct Stats { int pk; float mx, sum; };
@@ -829,12 +830,22 @@ static void ble_status(uint8_t state, uint8_t tries, float exp_ms) {
     memcpy(last_state + 2, &exp_ms, 4);
     last_state[6] = meter_kind;
     last_state[7] = meter_flags;
+    {
+        uint16_t a = meter_cal_age_min ? meter_cal_age_min() : 0xFFFF;
+        last_state[8] = (uint8_t)(a & 0xFF);
+        last_state[9] = (uint8_t)(a >> 8);
+    }
     ble_notify(sta_handle, sta_sub, last_state, sizeof last_state);
 }
 // Re-send the current status with the latest meter flags (the dial moved, or calibration finished).
 static void ble_status_refresh() {
     last_state[6] = meter_kind;
     last_state[7] = meter_flags;
+    {
+        uint16_t a = meter_cal_age_min ? meter_cal_age_min() : 0xFFFF;
+        last_state[8] = (uint8_t)(a & 0xFF);
+        last_state[9] = (uint8_t)(a >> 8);
+    }
     ble_notify(sta_handle, sta_sub, last_state, sizeof last_state);
 }
 
@@ -952,6 +963,11 @@ static int ble_access_cb(uint16_t, uint16_t, struct ble_gatt_access_ctxt *ctxt, 
     }
     if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
         uint8_t b[32];
+        if (which == 2) {
+            uint16_t a = meter_cal_age_min ? meter_cal_age_min() : 0xFFFF;
+            last_state[8] = (uint8_t)(a & 0xFF);
+            last_state[9] = (uint8_t)(a >> 8);
+        }
         if (which == 2) return os_mbuf_append(ctxt->om, last_state, sizeof last_state) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
         if (which == 1 && have_result) return os_mbuf_append(ctxt->om, b, summary_packet(b)) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
         return 0;
@@ -1596,6 +1612,13 @@ static void mk_init() {
         for (int i = 0; i < n && i < 4; i++) mk_pending[i] = list[i];
 }
 
+static uint16_t mk_age_min() {
+    uint32_t s = munki::dark_age_s();
+    if (s == 0xFFFFFFFFu) return 0xFFFF;
+    uint32_t m = s / 60;
+    return (uint16_t)(m > 0xFFFE ? 0xFFFE : m);
+}
+
 static uint8_t mk_flags_now() {
     return (uint8_t)((mk_dial <= 3 ? (0x80 | mk_dial) : 0) | (munki::dark_valid() ? 0x04 : 0));
 }
@@ -1725,6 +1748,7 @@ static void mk_do(uint8_t dial) {
 // Runs while a ColorMunki is attached; returns when it is unplugged.
 static void mk_session() {
     meter_kind = 1;
+    meter_cal_age_min = mk_age_min;
     strncpy(device_id, "COLORMUNKI", sizeof device_id);
     range_lo = 380;
     range_hi = 730;
@@ -1777,6 +1801,7 @@ static void mk_session() {
     munki::close();
     if (mk_dev) { usb_host_device_close(mk_client, mk_dev); mk_dev = NULL; }
     meter_kind = 0;
+    meter_cal_age_min = NULL;
     meter_flags = 0;
     device_id[0] = 0;
     range_lo = 340;

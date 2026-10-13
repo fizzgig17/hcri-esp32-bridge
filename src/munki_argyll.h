@@ -77,6 +77,8 @@ struct Spectrum {
 // Dark calibration: dial on CALIBRATION. Reads the sensor dark level at two integration times, as Argyll does.
 bool dark_calibrate();
 bool dark_valid();
+// Seconds since the last successful dark calibration, or 0xFFFFFFFF when there is none.
+uint32_t dark_age_s();
 // Dial must already be on the matching position. MR_LOW_LIGHT still returns a usable spectrum.
 Result measure_spectrum(Mode mode, Spectrum *out);
 const char *result_name(Result r);
