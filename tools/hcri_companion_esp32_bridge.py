@@ -9,6 +9,7 @@ hCRI Companion ESP32 Bridge -- find the ESP32 on USB, show what it is, download 
     python hcri_companion_esp32_bridge.py --s3       the board is a T-Display S3: no identifying, no choosing
     python hcri_companion_esp32_bridge.py --s3pro    the board is a T-Display-S3 Pro: same (--pro also works)
     python hcri_companion_esp32_bridge.py --yes      answer every question with its default, so it just flashes
+    python hcri_companion_esp32_bridge.py --munki    flash the ColorMunki identify tool (T-Display-S3 Pro only)
 
 Hands-off examples:  py hcri_companion_esp32_bridge.py --s3 --prod --yes
                      py hcri_companion_esp32_bridge.py --s3pro --dev --yes
@@ -40,6 +41,7 @@ FIRMWARE = [
     ("Torch Bearer bridge - T-Display-S3 Pro", "hcri-esp32-bridge-pro-factory.bin"),
 ]
 # Which release tag(s) hold each asset, in the order they are tried.
+MUNKI = ("ColorMunki identify tool - T-Display-S3 Pro", "colormunki-probe-pro.bin")   # only with --munki
 PROBE_ASSET = "board-probe.bin"
 PROBE_TAG = "board-probe-latest"
 BOARD_NAMES = {"pro": "LilyGo T-Display-S3 Pro", "s3": "LilyGo T-Display S3"}
@@ -51,6 +53,7 @@ FOR_BOARD = {
 TAGS = {
     "hcri-esp32-bridge-factory.bin": {"stable": "prod-latest", "dev": "dev-latest"},
     "hcri-esp32-bridge-pro-factory.bin": {"stable": "prod-latest", "dev": "dev-latest"},
+    MUNKI[1]: {"stable": "colormunki-probe-latest", "dev": "colormunki-probe-latest"},
     PROBE_ASSET: {"stable": PROBE_TAG, "dev": PROBE_TAG},
 }
 
@@ -374,6 +377,11 @@ def main():
                 print("(The board is now on %s.)" % port)
 
     choices = [fw for fw in FIRMWARE if kind is None or fw[1] in FOR_BOARD[kind]]
+    if "--munki" in sys.argv:
+        if kind == "s3":
+            print("\nThe ColorMunki identify tool is for the T-Display-S3 Pro only. Nothing was changed.")
+            return 1
+        choices = [MUNKI]
     default = 0
     if st.get("last") in [n for _, n in choices]:
         default = [n for _, n in choices].index(st["last"])
@@ -425,7 +433,8 @@ def main():
         print("\nFlashing failed. Put the board in download mode (hold BOOT, tap RESET, release BOOT)")
         print("and run this again. If it still fails, try a different USB cable or port.")
         return 1
-    st["last"] = asset_name
+    if asset_name != MUNKI[1]:
+        st["last"] = asset_name   # the identify tool never becomes the default
     save_state(st)
     print("\nDone. Tap RESET on the board (or unplug and replug it) to start the new firmware.")
     return 0

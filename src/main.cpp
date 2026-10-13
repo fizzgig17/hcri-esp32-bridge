@@ -1222,6 +1222,186 @@ static bool button_pressed() {
     return gpio_get_level((gpio_num_t)PIN_BTN_A) == 0 || gpio_get_level((gpio_num_t)PIN_BTN_B) == 0;
 }
 
+#ifdef COLORMUNKI_PROBE
+// ------------------------------------------------------- ColorMunki probe ----
+// Built with -DCOLORMUNKI_PROBE=1 (env colormunki-probe-pro, Pro only). Instead of the Torch Bearer bridge it shows the
+// USB IDs, strings, descriptors and endpoints of whatever is plugged into the USB-C port (through a USB-C to USB-A
+// adapter, with the Pro's 5 V boost powering it), so a new instrument can be identified before a driver is written.
+// Any button pages through the lines; every line is also logged.
+#ifndef BOARD_PRO
+#error "the ColorMunki probe is for the T-Display-S3 Pro only (env colormunki-probe-pro)"
+#endif
+#include "usb/usb_helpers.h"
+
+static usb_host_client_handle_t pr_client = NULL;
+static usb_device_handle_t pr_dev = NULL;
+static volatile uint8_t pr_new_addr = 0;
+static volatile bool pr_gone = false;
+#define PR_MAX_LINES 72
+#define PR_PER_PAGE 14
+static char pr_txt[PR_MAX_LINES][54];
+static int pr_n = 0;
+static int pr_page = 0;
+
+static void pr_client_cb(const usb_host_client_event_msg_t *m, void *) {
+    if (m->event == USB_HOST_CLIENT_EVENT_NEW_DEV) pr_new_addr = m->new_dev.address;
+    else if (m->event == USB_HOST_CLIENT_EVENT_DEV_GONE) pr_gone = true;
+}
+
+static void pr_add(const char *fmt, ...) {
+    if (pr_n >= PR_MAX_LINES) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(pr_txt[pr_n], sizeof pr_txt[0], fmt, ap);
+    va_end(ap);
+    ESP_LOGI(TAG, "%s", pr_txt[pr_n]);
+    pr_n++;
+}
+
+static void pr_str(const char *label, const usb_str_desc_t *sd) {
+    char b[36] = "-";
+    if (sd && sd->bLength >= 4) {
+        int n = (sd->bLength - 2) / 2;
+        if (n > 34) n = 34;
+        for (int i = 0; i < n; i++) {
+            uint16_t w = sd->wData[i];
+            b[i] = (w >= 32 && w < 127) ? (char)w : '?';
+        }
+        b[n] = 0;
+    }
+    pr_add("%s %s", label, b);
+}
+
+static void pr_describe() {
+    pr_n = 0;
+    usb_device_info_t info;
+    const usb_device_desc_t *dd = NULL;
+    if (usb_host_get_device_info(pr_dev, &info) != ESP_OK || usb_host_get_device_descriptor(pr_dev, &dd) != ESP_OK || !dd) {
+        pr_add("COULD NOT READ THE DEVICE DESCRIPTOR");
+        return;
+    }
+    pr_add("VID %04X  PID %04X  BCD %04X", dd->idVendor, dd->idProduct, dd->bcdDevice);
+    pr_add("CLASS %02X/%02X/%02X  EP0 %d  USB %X.%02X", dd->bDeviceClass, dd->bDeviceSubClass, dd->bDeviceProtocol,
+           dd->bMaxPacketSize0, dd->bcdUSB >> 8, dd->bcdUSB & 0xFF);
+    pr_add("SPEED %s  ADDR %d  CONFIGS %d", info.speed == USB_SPEED_LOW ? "LOW" : info.speed == USB_SPEED_FULL ? "FULL" : "HIGH",
+           info.dev_addr, dd->bNumConfigurations);
+    pr_str("MFG", info.str_desc_manufacturer);
+    pr_str("PRODUCT", info.str_desc_product);
+    pr_str("SERIAL", info.str_desc_serial_num);
+    const usb_config_desc_t *cd = NULL;
+    if (usb_host_get_active_config_descriptor(pr_dev, &cd) != ESP_OK || !cd) {
+        pr_add("NO CONFIG DESCRIPTOR");
+        return;
+    }
+    pr_add("CONFIG %d: %d IF  %d MA  %d BYTES", cd->bConfigurationValue, cd->bNumInterfaces, cd->bMaxPower * 2, cd->wTotalLength);
+    static const char *const types[] = {"CTRL", "ISO", "BULK", "INT"};
+    for (int i = 0; i < cd->bNumInterfaces; i++) {
+        for (int alt = 0; alt < 4; alt++) {
+            int off = 0;
+            const usb_intf_desc_t *id = usb_parse_interface_descriptor(cd, i, alt, &off);
+            if (!id) break;
+            pr_add("IF %d ALT %d CLASS %02X/%02X/%02X  %d EP", id->bInterfaceNumber, id->bAlternateSetting, id->bInterfaceClass,
+                   id->bInterfaceSubClass, id->bInterfaceProtocol, id->bNumEndpoints);
+            for (int e = 0; e < id->bNumEndpoints; e++) {
+                int eo = off;
+                const usb_ep_desc_t *ep = usb_parse_endpoint_descriptor_by_index(id, e, cd->wTotalLength, &eo);
+                if (!ep) break;
+                pr_add("  EP %02X %s %s  MAX %d  IVL %d", ep->bEndpointAddress, (ep->bEndpointAddress & 0x80) ? "IN" : "OUT",
+                       types[ep->bmAttributes & 3], ep->wMaxPacketSize, ep->bInterval);
+            }
+        }
+    }
+}
+
+static void pr_frame(const char *right, uint16_t rc) {
+    clear();
+    text(6, 4, "COLORMUNKI PROBE", 2, WHITE);
+    (void)right;
+    (void)rc;
+    draw_battery();
+    for (int x = 0; x < W; x++) px(x, 22, GREY);
+}
+
+static void pr_waiting() {
+    pr_frame("", GREY);
+    text(6, 40, "PLUG IN THE COLORMUNKI", 2, YELLOW);
+    text(6, 64, "USB-C TO USB-A ADAPTER", 1, GREY);
+    textf(6, 80, 1, otg_on ? GREEN : RED, "5 V BOOST %s", otg_on ? "ON" : "OFF");
+    textf(6, 160, 1, GREY, "FW %s", FW_VERSION);
+    present();
+}
+
+static void pr_show() {
+    pr_frame("", GREY);
+    int pages = pr_n ? (pr_n + PR_PER_PAGE - 1) / PR_PER_PAGE : 1;
+    if (pr_page >= pages) pr_page = 0;
+    for (int i = 0; i < PR_PER_PAGE; i++) {
+        int k = pr_page * PR_PER_PAGE + i;
+        if (k >= pr_n) break;
+        text(4, 28 + i * 9, pr_txt[k], 1, WHITE);
+    }
+    textf(4, 160, 1, GREY, "PAGE %d/%d  BUTTON = NEXT  FW %s", pr_page + 1, pages, FW_VERSION);
+    present();
+}
+
+extern "C" void app_main() {
+    gpio_config_t bi = {};
+    bi.mode = GPIO_MODE_INPUT;
+    bi.pull_up_en = GPIO_PULLUP_ENABLE;
+    bi.pin_bit_mask = (1ULL << PIN_BTN_A) | (1ULL << PIN_BTN_B);
+    gpio_config(&bi);
+
+    ESP_LOGI(TAG, "ColorMunki probe, firmware commit %s", FW_VERSION);
+    lcd_init();
+    battery_init();   // switches the 5 V boost on when nothing powers the USB-C port
+    usb_start();
+    usb_host_client_config_t cc = {};
+    cc.is_synchronous = false;
+    cc.max_num_event_msg = 5;
+    cc.async.client_event_callback = pr_client_cb;
+    cc.async.callback_arg = NULL;
+    ESP_ERROR_CHECK(usb_host_client_register(&cc, &pr_client));
+    pr_waiting();
+
+    while (true) {
+        usb_host_client_handle_events(pr_client, pdMS_TO_TICKS(100));
+        if (pr_new_addr) {
+            uint8_t addr = pr_new_addr;
+            pr_new_addr = 0;
+            if (pr_dev) {
+                usb_host_device_close(pr_client, pr_dev);
+                pr_dev = NULL;
+            }
+            if (usb_host_device_open(pr_client, addr, &pr_dev) == ESP_OK) {
+                pr_describe();
+                pr_page = 0;
+                pr_show();
+            } else {
+                pr_dev = NULL;
+                ESP_LOGW(TAG, "could not open the new USB device");
+            }
+        }
+        if (pr_gone) {
+            pr_gone = false;
+            if (pr_dev) {
+                usb_host_device_close(pr_client, pr_dev);
+                pr_dev = NULL;
+            }
+            pr_waiting();
+        }
+        if (pr_dev && button_pressed()) {
+            vTaskDelay(pdMS_TO_TICKS(30));
+            if (button_pressed()) {
+                pr_page++;
+                pr_show();
+                while (button_pressed()) vTaskDelay(pdMS_TO_TICKS(20));
+            }
+        }
+        battery_tick();
+    }
+}
+
+#else
 // -------------------------------------------------------------- main ----
 extern "C" void app_main() {
     gpio_config_t bi = {};
@@ -1300,3 +1480,5 @@ extern "C" void app_main() {
         ble_status(3, 0, 0);
     }
 }
+
+#endif  // COLORMUNKI_PROBE
