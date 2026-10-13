@@ -795,7 +795,10 @@ static volatile bool ble_scan_req = false;
 static volatile bool ble_resend_req = false;
 static bool have_result = false;
 // State 3 = no spectrometer: that is what a phone must read when it connects before one is plugged in (it becomes 0 'ready' once USB connects).
-static uint8_t last_state[6] = {3};
+// Bytes 6 and 7 are new: [6] meter kind (0 Torch Bearer, 1 ColorMunki), [7] ColorMunki flags: bit7 dial known, bits0-1 dial position
+// (0 projector, 1 surface, 2 calibration, 3 ambient), bit2 dark calibration done. Older apps read only the first 6 bytes.
+static uint8_t last_state[8] = {3};
+static uint8_t meter_kind = 0, meter_flags = 0;
 
 struct Stats { int pk; float mx, sum; };
 static Stats stats_of(const Scan &s) {
@@ -824,6 +827,14 @@ static void ble_status(uint8_t state, uint8_t tries, float exp_ms) {
     last_state[0] = state;
     last_state[1] = tries;
     memcpy(last_state + 2, &exp_ms, 4);
+    last_state[6] = meter_kind;
+    last_state[7] = meter_flags;
+    ble_notify(sta_handle, sta_sub, last_state, sizeof last_state);
+}
+// Re-send the current status with the latest meter flags (the dial moved, or calibration finished).
+static void ble_status_refresh() {
+    last_state[6] = meter_kind;
+    last_state[7] = meter_flags;
     ble_notify(sta_handle, sta_sub, last_state, sizeof last_state);
 }
 
@@ -1089,7 +1100,7 @@ static void draw_btn_note() {
 }
 
 static void header(const char *right, uint16_t rc) {
-    text(6, 4, "TORCH BEARER", 2, WHITE);
+    text(6, 4, meter_kind == 1 ? "COLORMUNKI" : "TORCH BEARER", 2, WHITE);
     // On the arrow screens the upright arrow owns the top-right corner, so the right-hand status steps left of it.
     int edge = (shown != 0 && !arrow_bottom_left()) ? W - 24 : W - 6;
     text(edge - (int)strlen(right) * 12, 4, right, 2, rc);
@@ -1111,7 +1122,9 @@ static void ui_waiting() {
     present();
 }
 
+static void ui_munki_ready();
 static void ui_ready() {
+    if (meter_kind == 1) { ui_munki_ready(); return; }
     clear();
     shown = 1;
     header("READY", GREEN);
@@ -1234,6 +1247,7 @@ static bool button_pressed() {
 #include "usb/usb_helpers.h"
 #include "munki_argyll.h"
 
+static void ui_munki_ready() {}   // the probe has no bridge screens; ui_ready() refers to this one
 static usb_host_client_handle_t pr_client = NULL;
 static usb_device_handle_t pr_dev = NULL;
 static volatile uint8_t pr_new_addr = 0;
@@ -1545,6 +1559,225 @@ extern "C" void app_main() {
 }
 
 #else
+// ------------------------------------------------------ ColorMunki mode ----
+// A ColorMunki Photo/Design (USB 0971:2007) plugged into the USB port is driven with the Argyll-derived driver in
+// munki_argyll.cpp. The phone sees the same Torch Bearer service: dial CALIBRATION + scan = dark calibration, dial AMBIENT +
+// scan = a reading, sent as a 1 nm spectrum interpolated from the instrument's 36 bands (380-730 nm, 10 nm).
+#include "usb/usb_helpers.h"
+#include "munki_argyll.h"
+
+static usb_host_client_handle_t mk_client = NULL;
+static usb_device_handle_t mk_dev = NULL;
+static volatile uint8_t mk_pending[4] = {0, 0, 0, 0};
+static volatile bool mk_gone = false;
+static uint8_t mk_dial = 0xFF;
+enum : uint8_t { MKR_TOO_BRIGHT = 1, MKR_COMMS = 2, MKR_NO_DARK = 3, MKR_NO_DATA = 4, MKR_WRONG_DIAL = 5 };
+static uint8_t mk_reason = 0;
+static const char *mk_msg = "";
+
+static void mk_client_cb(const usb_host_client_event_msg_t *e, void *) {
+    if (e->event == USB_HOST_CLIENT_EVENT_NEW_DEV) {
+        for (int i = 0; i < 4; i++) if (!mk_pending[i]) { mk_pending[i] = e->new_dev.address; break; }
+    } else if (e->event == USB_HOST_CLIENT_EVENT_DEV_GONE) {
+        if (mk_dev && e->dev_gone.dev_hdl == mk_dev) mk_gone = true;
+    }
+}
+
+static void mk_init() {
+    usb_host_client_config_t cc = {};
+    cc.is_synchronous = false;
+    cc.max_num_event_msg = 5;
+    cc.async.client_event_callback = mk_client_cb;
+    cc.async.callback_arg = NULL;
+    if (usb_host_client_register(&cc, &mk_client) != ESP_OK) { mk_client = NULL; return; }
+    uint8_t list[8];
+    int n = 0;
+    if (usb_host_device_addr_list_fill(sizeof list, list, &n) == ESP_OK)   // devices already attached at boot
+        for (int i = 0; i < n && i < 4; i++) mk_pending[i] = list[i];
+}
+
+static uint8_t mk_flags_now() {
+    return (uint8_t)((mk_dial <= 3 ? (0x80 | mk_dial) : 0) | (munki::dark_valid() ? 0x04 : 0));
+}
+
+// Looks at newly attached devices; returns true once a ColorMunki is open and its calibration data is read.
+static bool mk_try_open() {
+    if (!mk_client) return false;
+    usb_host_client_handle_events(mk_client, 0);
+    for (int i = 0; i < 4; i++) {
+        uint8_t a = mk_pending[i];
+        if (!a) continue;
+        mk_pending[i] = 0;
+        usb_device_handle_t d = NULL;
+        if (usb_host_device_open(mk_client, a, &d) != ESP_OK) continue;
+        const usb_device_desc_t *dd = NULL;
+        if (usb_host_get_device_descriptor(d, &dd) != ESP_OK || !dd || dd->idVendor != 0x0971 || dd->idProduct != 0x2007) {
+            usb_host_device_close(mk_client, d);
+            continue;
+        }
+        mk_dev = d;
+        mk_gone = false;
+        munki::Eeprom ee;
+        munki::Firmware fw;
+        if (munki::open(mk_client, mk_dev) && munki::get_firmware(&fw) && munki::read_calibration(&ee) && ee.sum_ok) {
+            ESP_LOGI(TAG, "ColorMunki: firmware %d.%d, calibration %d bytes (v%d)", fw.fw_major, fw.fw_minor, ee.size, ee.cal_version);
+            return true;
+        }
+        ESP_LOGW(TAG, "ColorMunki found but could not be read");
+        munki::close();
+        usb_host_device_close(mk_client, mk_dev);
+        mk_dev = NULL;
+    }
+    return false;
+}
+
+// 36 bands at 10 nm -> 351 points at 1 nm (Catmull-Rom, clamped at zero), the grid the rest of the bridge and the app use.
+static void mk_fill_scan(const munki::Spectrum &s, bool low_light) {
+    scan.start_nm = 380;
+    scan.npts = 351;
+    scan.exposure_ms = (float)(s.inttime * 1000.0);
+    scan.status = low_light ? 2 : 0;
+    for (int i = 0; i < 351; i++) {
+        int seg = i / 10;
+        float t = (i % 10) / 10.0f;
+        if (seg >= 35) { scan.spd[i] = s.v[35] < 0 ? 0 : s.v[35]; continue; }
+        float p0 = s.v[seg > 0 ? seg - 1 : 0], p1 = s.v[seg], p2 = s.v[seg + 1], p3 = s.v[seg + 2 < 36 ? seg + 2 : 35];
+        float v = 0.5f * ((2 * p1) + (-p0 + p2) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t * t + (-p0 + 3 * p1 - 3 * p2 + p3) * t * t * t);
+        scan.spd[i] = v < 0 ? 0 : v;
+    }
+}
+
+static const char *mk_dial_name(uint8_t d) {
+    return d == munki::POS_CALIB ? "CALIBRATION" : d == munki::POS_AMBIENT ? "AMBIENT" : d == munki::POS_SURF ? "SURFACE" : d == munki::POS_PROJ ? "PROJECTOR" : "-";
+}
+
+static void ui_munki_ready() {
+    clear();
+    shown = 1;
+    header("READY", GREEN);
+    text(6, 30, "DIAL", 1, GREY);
+    text(6, 40, mk_dial_name(mk_dial), 3, YELLOW);
+    bool dv = munki::dark_valid();
+    text(6, 70, dv ? "CALIBRATED" : "NOT CALIBRATED", 2, dv ? GREEN : YELLOW);
+    if (*mk_msg) text(6, 94, mk_msg, 1, RED);
+    else if (mk_dial == munki::POS_CALIB) text(6, 94, "PRESS BUTTON TO CALIBRATE", 1, CYAN);
+    else if (mk_dial == munki::POS_AMBIENT) text(6, 94, dv ? "PRESS BUTTON TO MEASURE" : "CALIBRATE FIRST (DIAL TO CALIBRATION)", 1, dv ? WHITE : YELLOW);
+    else text(6, 94, "SET THE DIAL TO AMBIENT (OR CALIBRATION)", 1, RED);
+    draw_btn_note();
+    draw_btn_arrow();
+    textf(arrow_bottom_left() ? 18 : 6, 160, 1, GREY, "FW %s", FW_VERSION);
+    present();
+}
+
+static void ui_munki_busy(const char *what) {
+    clear();
+    header("WORKING", YELLOW);
+    text(10, 60, what, 2, WHITE);
+    text(10, 90, "KEEP THE DIAL STILL", 1, GREY);
+    present();
+}
+
+static void mk_fail(uint8_t reason, const char *msg) {
+    mk_reason = reason;
+    mk_msg = msg;
+    ble_status(5, reason, 0);
+    ui_munki_ready();
+}
+
+static void mk_do(uint8_t dial) {
+    mk_msg = "";
+    if (dial == munki::POS_CALIB) {
+        ble_status(1, 0, 0);
+        ui_munki_busy("CALIBRATING...");
+        bool ok = munki::dark_calibrate();
+        mk_dial = dial;
+        meter_flags = mk_flags_now();
+        if (!ok) { mk_fail(MKR_COMMS, "CALIBRATION FAILED"); return; }
+        ble_status(0, 0, 0);
+        ui_munki_ready();
+    } else if (dial == munki::POS_AMBIENT) {
+        if (!munki::dark_valid()) { mk_fail(MKR_NO_DARK, "CALIBRATE FIRST (DIAL TO CALIBRATION)"); return; }
+        ble_status(1, 0, 0);
+        ui_munki_busy("MEASURING...");
+        munki::Spectrum s;
+        munki::Result r = munki::measure_spectrum(munki::MODE_AMBIENT, &s);
+        if (r == munki::MR_OK || r == munki::MR_LOW_LIGHT) {
+            mk_fill_scan(s, r == munki::MR_LOW_LIGHT);
+            have_result = true;
+            ui_result(true);
+            ble_status(2, 0, scan.exposure_ms);
+            ble_send_result();
+        } else if (r == munki::MR_TOO_BRIGHT) mk_fail(MKR_TOO_BRIGHT, "TOO BRIGHT");
+        else if (r == munki::MR_NO_DARK) mk_fail(MKR_NO_DARK, "CALIBRATE FIRST (DIAL TO CALIBRATION)");
+        else if (r == munki::MR_COMMS) mk_fail(MKR_COMMS, "INSTRUMENT NOT ANSWERING");
+        else mk_fail(MKR_NO_DATA, "MEASUREMENT FAILED");
+    } else {
+        mk_fail(MKR_WRONG_DIAL, "SET THE DIAL TO AMBIENT (OR CALIBRATION)");
+    }
+}
+
+// Runs while a ColorMunki is attached; returns when it is unplugged.
+static void mk_session() {
+    meter_kind = 1;
+    strncpy(device_id, "COLORMUNKI", sizeof device_id);
+    range_lo = 380;
+    range_hi = 730;
+    mk_dial = 0xFF;
+    mk_msg = "";
+    meter_flags = mk_flags_now();
+    ble_status(0, 0, 0);
+    ui_munki_ready();
+    uint8_t bt_prev = 0;
+    int fails = 0;
+    while (!mk_gone && fails < 5) {
+        uint8_t sp = 0xFF, bt = 0;
+        if (munki::get_status(&sp, &bt)) fails = 0; else { fails++; sp = mk_dial; }
+        bool dial_changed = sp != mk_dial;
+        if (dial_changed) {
+            mk_dial = sp;
+            mk_msg = "";
+        }
+        uint8_t fl = mk_flags_now();
+        if (fl != meter_flags) {
+            meter_flags = fl;
+            ble_status_refresh();
+        }
+        bool trigger = false, from_button = false;
+        if (ble_scan_req) trigger = true;
+        else if (bt && !bt_prev) trigger = true;
+        else if (button_pressed()) {
+            vTaskDelay(pdMS_TO_TICKS(30));
+            trigger = from_button = button_pressed();
+            if (trigger) { btn_seen = button_mask(); btn_note(btn_seen); }
+        }
+        bt_prev = bt;
+        if (ble_resend_req) { ble_resend_req = false; ble_send_result(); }
+        if (trigger) {
+            ble_scan_req = false;
+            mk_do(mk_dial);
+            meter_flags = mk_flags_now();
+            ble_status_refresh();
+            if (from_button) while (button_pressed()) vTaskDelay(pdMS_TO_TICKS(20));
+            bt_prev = 1;   // don't re-trigger on an instrument button still held
+        } else if (dial_changed && shown == 1) {
+            ui_munki_ready();
+        }
+        flip_tick();
+        btn_tick();
+        battery_tick();
+        link_tick();
+        vTaskDelay(pdMS_TO_TICKS(60));
+    }
+    munki::close();
+    if (mk_dev) { usb_host_device_close(mk_client, mk_dev); mk_dev = NULL; }
+    meter_kind = 0;
+    meter_flags = 0;
+    device_id[0] = 0;
+    range_lo = 340;
+    range_hi = 1000;
+    have_result = false;
+}
+
 // -------------------------------------------------------------- main ----
 extern "C" void app_main() {
     gpio_config_t bi = {};
@@ -1560,13 +1793,18 @@ extern "C" void app_main() {
     lcd_init();
     battery_init();
     usb_start();
+    mk_init();
     ble_start();
     ui_waiting();
 
     while (true) {
-        // 1. wait for the spectrometer
+        // 1. wait for the spectrometer (or a ColorMunki)
         while (!usb_connected) {
-            if (usb_try_open() && tb_init()) {
+            if (mk_try_open()) {
+                mk_session();
+                ui_waiting();
+                ble_status(3, 0, 0);
+            } else if (usb_try_open() && tb_init()) {
                 usb_connected = true;
                 ESP_LOGI(TAG, "connected: %s  %d-%d nm", device_id, range_lo, range_hi);
             } else {

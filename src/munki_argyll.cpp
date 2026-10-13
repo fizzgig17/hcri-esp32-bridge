@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Ported from ArgyllCMS spectro/munki_imp.c (Copyright Graeme W. Gill, AGPL-3.0). See munki_argyll.h.
-#ifdef COLORMUNKI_PROBE
 #include "munki_argyll.h"
 #include <string.h>
 #include <stdlib.h>
@@ -438,4 +437,3 @@ const char *pos_name(uint8_t s) {
 }
 
 }  // namespace munki
-#endif  // COLORMUNKI_PROBE
