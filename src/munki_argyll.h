@@ -28,6 +28,19 @@ bool get_chip_id(uint8_t out[8]);        // 0x8A
 bool get_status(uint8_t *spos, uint8_t *button);   // 0x87: sensor position, button (1 = pressed)
 bool read_eeprom(uint8_t *buf, int addr, int size);  // 0x81 request then bulk IN 0x81
 
+// Reads the instrument's calibration block (size is stored at EEPROM offset 4) and checks its checksum, as Argyll does.
+struct Eeprom {
+    int size;                 // calibration block length in bytes
+    int cal_version;          // calibration version
+    int compat_version;       // oldest software version that understands it
+    uint32_t sum_stored;      // checksum held in the block
+    uint32_t sum_calc;        // checksum worked out from the data
+    bool read_ok;             // transfer completed
+    bool sum_ok;              // checksums match
+};
+bool read_calibration(Eeprom *e);
+const uint8_t *calibration_data();   // the block read above (nullptr until read), length = Eeprom::size rounded up to 4
+
 const char *pos_name(uint8_t spos);
 
 }  // namespace munki

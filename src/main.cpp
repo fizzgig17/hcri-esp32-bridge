@@ -1318,6 +1318,8 @@ static void pr_describe() {
 // Talks to the instrument with the Argyll-derived driver (munki_argyll.cpp) and adds what it says to the pages.
 static bool pr_munki = false;
 static uint8_t pr_spos = 0xFF, pr_but = 0;
+static munki::Eeprom pr_ee;
+static int pr_ee_state = 0;   // 0 not read, 1 checksum OK, 2 checksum BAD, 3 read failed
 static void pr_query() {
     pr_munki = false;
     if (!munki::open(pr_client, pr_dev)) { pr_add("MUNKI: COULD NOT CLAIM INTERFACE 0"); return; }
@@ -1331,6 +1333,17 @@ static void pr_query() {
     }
     char v[37];
     if (munki::get_version(v)) pr_add("VERSION %s", v);
+    pr_ee_state = 0;
+    if (pr_munki) {
+        if (!munki::read_calibration(&pr_ee)) {
+            pr_ee_state = 3;
+            pr_add("EEPROM READ FAILED (SIZE %d)", pr_ee.size);
+        } else {
+            pr_ee_state = pr_ee.sum_ok ? 1 : 2;
+            pr_add("EEPROM %d BYTES  CAL V%d (COMPAT %d)", pr_ee.size, pr_ee.cal_version, pr_ee.compat_version);
+            pr_add("CHECKSUM %08X / %08X  %s", (unsigned)pr_ee.sum_stored, (unsigned)pr_ee.sum_calc, pr_ee.sum_ok ? "OK" : "BAD");
+        }
+    }
     uint8_t id[8];
     if (munki::get_chip_id(id)) pr_add("CHIP %02X-%02X%02X%02X%02X%02X%02X%02X", id[0], id[1], id[2], id[3], id[4], id[5], id[6], id[7]);
 }
@@ -1353,16 +1366,29 @@ static void pr_waiting() {
     present();
 }
 
+// Page 0 is the big live status (when a ColorMunki answers); the USB detail pages follow it.
 static void pr_show() {
     pr_frame("", GREY);
-    int pages = pr_n ? (pr_n + PR_PER_PAGE - 1) / PR_PER_PAGE : 1;
+    int base = pr_munki ? 1 : 0;
+    int dpages = pr_n ? (pr_n + PR_PER_PAGE - 1) / PR_PER_PAGE : 1;
+    int pages = base + dpages;
     if (pr_page >= pages) pr_page = 0;
-    for (int i = 0; i < PR_PER_PAGE; i++) {
-        int k = pr_page * PR_PER_PAGE + i;
-        if (k >= pr_n) break;
-        text(4, 28 + i * 9, pr_txt[k], 1, WHITE);
+    if (pr_munki && pr_page == 0) {
+        text(6, 28, "DIAL", 1, GREY);
+        text(6, 40, pr_spos == 0xFF ? "-" : munki::pos_name(pr_spos), 4, YELLOW);
+        text(6, 80, "BUTTON", 1, GREY);
+        text(6, 92, pr_but ? "PRESSED" : "-", 3, pr_but ? GREEN : YELLOW);
+        text(6, 124, "EEPROM", 1, GREY);
+        const char *es = pr_ee_state == 1 ? "CHECKSUM OK" : pr_ee_state == 2 ? "CHECKSUM BAD" : pr_ee_state == 3 ? "READ FAILED" : "-";
+        text(6, 136, es, 2, pr_ee_state == 1 ? GREEN : pr_ee_state == 0 ? GREY : RED);
+    } else {
+        int dp = pr_page - base;
+        for (int i = 0; i < PR_PER_PAGE; i++) {
+            int k = dp * PR_PER_PAGE + i;
+            if (k >= pr_n) break;
+            text(4, 28 + i * 9, pr_txt[k], 1, WHITE);
+        }
     }
-    if (pr_munki) textf(4, 148, 1, YELLOW, "DIAL %s  MUNKI BUTTON %s", pr_spos == 0xFF ? "-" : munki::pos_name(pr_spos), pr_but ? "PRESSED" : "-");
     textf(4, 160, 1, GREY, "PAGE %d/%d  BUTTON = NEXT  FW %s", pr_page + 1, pages, FW_VERSION);
     present();
 }

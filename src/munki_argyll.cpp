@@ -3,6 +3,7 @@
 #ifdef COLORMUNKI_PROBE
 #include "munki_argyll.h"
 #include <string.h>
+#include <stdlib.h>
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -151,6 +152,40 @@ bool read_eeprom(uint8_t *buf, int addr, int size) {
     int2buf(&p[4], size);
     if (!ctrl(false, 0x81, p, 8)) return false;
     return bulk_in(buf, size, 6000);
+}
+
+static uint8_t *g_cal = NULL;
+
+static uint32_t buf2uint(const uint8_t *b) { return (uint32_t)buf2int(b); }
+
+const uint8_t *calibration_data() { return g_cal; }
+
+// Argyll munki_imp_init(): read the size at offset 4, read that many bytes from offset 0, sum the 32 bit words
+// with the stored checksum (at offset 8) zeroed, and compare.
+bool read_calibration(Eeprom *e) {
+    memset(e, 0, sizeof *e);
+    free(g_cal);
+    g_cal = NULL;
+    uint8_t sz[4];
+    if (!read_eeprom(sz, 4, 4)) return false;
+    int calsize = buf2int(sz);
+    if (calsize < 12 || calsize > 2 * 8192) { e->size = calsize; return false; }
+    int ru = (calsize + 3) & ~3;
+    uint8_t *b = (uint8_t *)calloc(ru, 1);
+    if (!b) return false;
+    if (!read_eeprom(b, 0, calsize)) { free(b); return false; }
+    e->size = calsize;
+    e->read_ok = true;
+    e->sum_stored = buf2uint(b + 8);
+    memset(b + 8, 0, 4);
+    uint32_t sum = 0;
+    for (int i = 0; i < ru - 3; i += 4) sum += buf2uint(b + i);
+    e->sum_calc = sum;
+    e->sum_ok = (sum == e->sum_stored);
+    e->cal_version = (int)(b[0] | (b[1] << 8));
+    e->compat_version = (int)(b[2] | (b[3] << 8));
+    g_cal = b;   // kept (with the checksum word zeroed, as Argyll does) for the parser
+    return true;
 }
 
 const char *pos_name(uint8_t s) {
