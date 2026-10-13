@@ -54,6 +54,14 @@ using namespace esp_usb;
 
 static const char *TAG = "tobes";
 
+// The git commit this firmware was built from (tools/fw_version.py passes -DFW_GIT=<commit>), shown on the idle screens.
+#ifndef FW_GIT
+#define FW_GIT dev
+#endif
+#define FW_STR2(x) #x
+#define FW_STR(x) FW_STR2(x)
+static const char *FW_VERSION = FW_STR(FW_GIT);
+
 // ---------------------------------------------------------------- pins ----
 #ifdef BOARD_PRO
 // LilyGo T-Display-S3 Pro: ST7796 on SPI, SY6970 power chip on I2C.
@@ -979,6 +987,7 @@ static void ui_waiting() {
     header("NO USB", RED);
     text(20, 70, "PLUG IN SPECTROMETER", 2, YELLOW);
     text(20, 100, "VIA OTG CABLE", 2, GREY);
+    textf(6, 160, 1, GREY, "FW %s", FW_VERSION);
     diag_on = true;
     draw_diag();
     present();
@@ -995,6 +1004,7 @@ static void ui_ready() {
     thick_line(196, 120, 280, 36, 4, YELLOW);
     thick_line(280, 36, 262, 36, 4, YELLOW);
     thick_line(280, 36, 280, 54, 4, YELLOW);
+    textf(6, 160, 1, GREY, "FW %s", FW_VERSION);
     diag_on = true;
     draw_diag();
     present();
@@ -1071,6 +1081,7 @@ extern "C" void app_main() {
     bi.pin_bit_mask = (1ULL << PIN_BTN_A) | (1ULL << PIN_BTN_B);
     gpio_config(&bi);
 
+    ESP_LOGI(TAG, "firmware commit %s", FW_VERSION);
     lcd_init();
     battery_init();
     usb_start();
