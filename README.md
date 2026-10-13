@@ -6,7 +6,7 @@ peak value, sum, exposure and a spectrum plot. GPLv3 (derived from Torch-Bearer-
 
 ## Hardware you need
 
-For use with the hCRI Companion Android app:
+For use with the hCRI Companion app (Android and iPhone):
 
 - **Torch Bearer spectrometer** (the thing being bridged).
 - **LilyGO T-Display S3**, the standard non-Pro version with 16 MB flash. It is the bridge: it talks
@@ -21,7 +21,7 @@ For use with the hCRI Companion Android app:
   While outside power is connected the 5 V output is off and the battery charges as usual; the
   battery does not charge while it is powering the Torch Bearer. This feature is untested on
   hardware (compile it out with `-DPRO_OTG_BOOST=0`).
-- **Android phone** with the hCRI Companion app (Android 8.0+, Bluetooth LE).
+- **Phone** with the hCRI Companion app: Android 7.0+ or iPhone with iOS 15.1+, with Bluetooth LE.
 - Optional: a diffuser in front of the lamp; about 25 cm distance works well.
 
 ## Installing it (short version)

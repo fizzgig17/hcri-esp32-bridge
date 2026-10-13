@@ -14,6 +14,7 @@
 
 #include <math.h>
 #include <stdarg.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
@@ -935,12 +936,42 @@ static void ble_start() {
     nimble_port_freertos_init(ble_host_task);
 }
 
+// ------------------------------------------------------------- app link ----
+// A Bluetooth rune and "APP" in the top-right corner (under the header) while the phone app is connected.
+static bool link_shown = false;
+static const int LINK_X = 292, LINK_Y = 26, LINK_W = W - 292, LINK_H = 32;
+static void thick_line(int x0, int y0, int x1, int y1, int t, uint16_t c) {
+    int n = abs(x1 - x0) > abs(y1 - y0) ? abs(x1 - x0) : abs(y1 - y0);
+    if (n == 0) n = 1;
+    for (int i = 0; i <= n; i++) fill(x0 + (x1 - x0) * i / n, y0 + (y1 - y0) * i / n, t, t, c);
+}
+static void draw_app_link() {
+    bool up = ble_conn != BLE_HS_CONN_HANDLE_NONE;
+    link_shown = up;
+    fill(LINK_X, LINK_Y, LINK_W, LINK_H, BLACK);
+    if (!up) return;
+    const int x = 300, y = 27;  // rune, about 9 x 15
+    thick_line(x + 4, y, x + 4, y + 14, 2, CYAN);
+    thick_line(x + 4, y, x + 8, y + 4, 2, CYAN);
+    thick_line(x + 8, y + 4, x, y + 10, 2, CYAN);
+    thick_line(x + 4, y + 14, x + 8, y + 10, 2, CYAN);
+    thick_line(x + 8, y + 10, x, y + 4, 2, CYAN);
+    text(298, 45, "APP", 1, CYAN);
+}
+// Called from the idle loops: redraw only when the phone connects or disconnects.
+static void link_tick() {
+    if ((ble_conn != BLE_HS_CONN_HANDLE_NONE) == link_shown) return;
+    draw_app_link();
+    present();
+}
+
 // ----------------------------------------------------------------- UI ----
 static void header(const char *right, uint16_t rc) {
     text(6, 4, "TORCH BEARER", 2, WHITE);
     text(W - 6 - (int)strlen(right) * 12, 4, right, 2, rc);
     draw_battery();
     for (int x = 0; x < W; x++) px(x, 22, GREY);
+    draw_app_link();
 }
 
 static void ui_waiting() {
@@ -958,7 +989,12 @@ static void ui_ready() {
     header("READY", GREEN);
     text(6, 32, device_id, 1, GREY);
     textf(6, 48, 1, GREY, "RANGE %d-%d NM", range_lo, range_hi);
-    text(20, 90, "PRESS BUTTON TO SCAN", 2, WHITE);
+    text(20, 84, "PRESS BUTTON", 2, WHITE);
+    text(20, 104, "TO SCAN", 2, WHITE);
+    // Arrow up and to the right: the button is just above the top-right corner of the screen.
+    thick_line(196, 120, 280, 36, 4, YELLOW);
+    thick_line(280, 36, 262, 36, 4, YELLOW);
+    thick_line(280, 36, 280, 54, 4, YELLOW);
     diag_on = true;
     draw_diag();
     present();
@@ -1051,6 +1087,7 @@ extern "C" void app_main() {
                 vcp.reset();
                 if (ble_scan_req) { ble_scan_req = false; ble_status(3, 0, 0); }
                 battery_tick();
+                link_tick();
                 vTaskDelay(pdMS_TO_TICKS(500));
             }
         }
@@ -1084,6 +1121,7 @@ extern "C" void app_main() {
                 // result stays on screen; the next press or BLE command starts a new scan
             }
             battery_tick();
+            link_tick();
             vTaskDelay(pdMS_TO_TICKS(20));
         }
 
