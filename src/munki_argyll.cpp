@@ -34,6 +34,16 @@ static void pump(Wait &w, int timeout_ms) {
     }
 }
 
+static char g_err[48] = "";
+const char *last_error() { return g_err; }
+static void set_err(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(g_err, sizeof g_err, fmt, ap);
+    va_end(ap);
+    ESP_LOGW(TAGM, "%s", g_err);
+}
+
 // Vendor control transfer on endpoint 0 (the instrument uses these for almost everything).
 static bool ctrl(bool in, uint8_t req, uint8_t *buf, int len, int timeout_ms = 2000) {
     if (!g_dev) return false;
@@ -64,16 +74,6 @@ static bool ctrl(bool in, uint8_t req, uint8_t *buf, int len, int timeout_ms = 2
     }
     if (w.done || !ok) usb_host_transfer_free(t);
     return ok;
-}
-
-static char g_err[48] = "";
-const char *last_error() { return g_err; }
-static void set_err(const char *fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(g_err, sizeof g_err, fmt, ap);
-    va_end(ap);
-    ESP_LOGW(TAGM, "%s", g_err);
 }
 
 // Bulk IN read (instrument data comes back on endpoint 0x81), handed to `sink` one transfer at a time so nothing larger
