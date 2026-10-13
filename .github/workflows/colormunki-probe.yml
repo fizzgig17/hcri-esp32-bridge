@@ -1,0 +1,54 @@
+# Builds the ColorMunki identify tool (env colormunki-probe-pro, T-Display-S3 Pro only) and publishes it at the fixed
+# release tag "colormunki-probe-latest". Flash colormunki-probe-pro.bin at 0x0, or use the flasher's --munki option.
+name: Build ColorMunki probe (T-Display-S3 Pro)
+
+on:
+  push:
+    paths: ['src/**', 'platformio.ini', 'tools/fw_version.py', '.github/workflows/colormunki-probe.yml']
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+          restore-keys: pio-${{ runner.os }}-
+      - run: pip install platformio esptool==4.8.1
+      - name: Build
+        run: |
+          set +e
+          pio run -e colormunki-probe-pro 2>&1 | tee build.log
+          rc=${PIPESTATUS[0]}
+          if [ $rc -ne 0 ]; then
+            grep -E "error|Error|undefined reference" build.log | head -15 | while IFS= read -r l; do echo "::error::${l:0:400}"; done
+          fi
+          exit $rc
+      - name: Merge into a single flashable image
+        working-directory: .pio/build/colormunki-probe-pro
+        run: |
+          python -m esptool --chip esp32s3 merge_bin -o colormunki-probe-pro.bin \
+            --flash_mode keep --flash_freq keep --flash_size keep \
+            0x0 bootloader.bin 0x8000 partitions.bin 0x10000 firmware.bin
+          sha256sum colormunki-probe-pro.bin | tee SHA256SUMS-munki.txt
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: colormunki-probe-latest
+          name: "ColorMunki probe"
+          prerelease: true
+          body: |
+            Identify tool for the T-Display-S3 Pro. Plug a ColorMunki into the USB-C port (USB-C to USB-A adapter);
+            the screen shows its USB IDs, strings and endpoints. Flash colormunki-probe-pro.bin at 0x0.
+          files: |
+            .pio/build/colormunki-probe-pro/colormunki-probe-pro.bin
+            .pio/build/colormunki-probe-pro/SHA256SUMS-munki.txt

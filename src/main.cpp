@@ -795,7 +795,11 @@ static volatile bool ble_scan_req = false;
 static volatile bool ble_resend_req = false;
 static bool have_result = false;
 // State 3 = no spectrometer: that is what a phone must read when it connects before one is plugged in (it becomes 0 'ready' once USB connects).
-static uint8_t last_state[6] = {3};
+// Bytes 6 and 7 are new: [6] meter kind (0 Torch Bearer, 1 ColorMunki), [7] ColorMunki flags: bit7 dial known, bits0-1 dial position
+// (0 projector, 1 surface, 2 calibration, 3 ambient), bit2 dark calibration done. Older apps read only the first 6 bytes.
+static uint8_t last_state[10] = {3, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF};
+static uint16_t (*meter_cal_age_min)() = NULL;   // ColorMunki: minutes since dark calibration (0xFFFF = none)
+static uint8_t meter_kind = 0, meter_flags = 0;
 
 struct Stats { int pk; float mx, sum; };
 static Stats stats_of(const Scan &s) {
@@ -824,6 +828,24 @@ static void ble_status(uint8_t state, uint8_t tries, float exp_ms) {
     last_state[0] = state;
     last_state[1] = tries;
     memcpy(last_state + 2, &exp_ms, 4);
+    last_state[6] = meter_kind;
+    last_state[7] = meter_flags;
+    {
+        uint16_t a = meter_cal_age_min ? meter_cal_age_min() : 0xFFFF;
+        last_state[8] = (uint8_t)(a & 0xFF);
+        last_state[9] = (uint8_t)(a >> 8);
+    }
+    ble_notify(sta_handle, sta_sub, last_state, sizeof last_state);
+}
+// Re-send the current status with the latest meter flags (the dial moved, or calibration finished).
+static void ble_status_refresh() {
+    last_state[6] = meter_kind;
+    last_state[7] = meter_flags;
+    {
+        uint16_t a = meter_cal_age_min ? meter_cal_age_min() : 0xFFFF;
+        last_state[8] = (uint8_t)(a & 0xFF);
+        last_state[9] = (uint8_t)(a >> 8);
+    }
     ble_notify(sta_handle, sta_sub, last_state, sizeof last_state);
 }
 
@@ -941,6 +963,11 @@ static int ble_access_cb(uint16_t, uint16_t, struct ble_gatt_access_ctxt *ctxt, 
     }
     if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
         uint8_t b[32];
+        if (which == 2) {
+            uint16_t a = meter_cal_age_min ? meter_cal_age_min() : 0xFFFF;
+            last_state[8] = (uint8_t)(a & 0xFF);
+            last_state[9] = (uint8_t)(a >> 8);
+        }
         if (which == 2) return os_mbuf_append(ctxt->om, last_state, sizeof last_state) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
         if (which == 1 && have_result) return os_mbuf_append(ctxt->om, b, summary_packet(b)) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
         return 0;
@@ -1089,7 +1116,7 @@ static void draw_btn_note() {
 }
 
 static void header(const char *right, uint16_t rc) {
-    text(6, 4, "TORCH BEARER", 2, WHITE);
+    text(6, 4, meter_kind == 1 ? "COLORMUNKI" : "TORCH BEARER", 2, WHITE);
     // On the arrow screens the upright arrow owns the top-right corner, so the right-hand status steps left of it.
     int edge = (shown != 0 && !arrow_bottom_left()) ? W - 24 : W - 6;
     text(edge - (int)strlen(right) * 12, 4, right, 2, rc);
@@ -1111,7 +1138,9 @@ static void ui_waiting() {
     present();
 }
 
+static void ui_munki_ready();
 static void ui_ready() {
+    if (meter_kind == 1) { ui_munki_ready(); return; }
     clear();
     shown = 1;
     header("READY", GREEN);
@@ -1222,6 +1251,564 @@ static bool button_pressed() {
     return gpio_get_level((gpio_num_t)PIN_BTN_A) == 0 || gpio_get_level((gpio_num_t)PIN_BTN_B) == 0;
 }
 
+#ifdef COLORMUNKI_PROBE
+// ------------------------------------------------------- ColorMunki probe ----
+// Built with -DCOLORMUNKI_PROBE=1 (env colormunki-probe-pro, Pro only). Instead of the Torch Bearer bridge it shows the
+// USB IDs, strings, descriptors and endpoints of whatever is plugged into the USB-C port (through a USB-C to USB-A
+// adapter, with the Pro's 5 V boost powering it), so a new instrument can be identified before a driver is written.
+// Any button pages through the lines; every line is also logged.
+#ifndef BOARD_PRO
+#error "the ColorMunki probe is for the T-Display-S3 Pro only (env colormunki-probe-pro)"
+#endif
+#include "usb/usb_helpers.h"
+#include "munki_argyll.h"
+
+static void ui_munki_ready() {}   // the probe has no bridge screens; ui_ready() refers to this one
+static usb_host_client_handle_t pr_client = NULL;
+static usb_device_handle_t pr_dev = NULL;
+static volatile uint8_t pr_new_addr = 0;
+static volatile bool pr_gone = false;
+#define PR_MAX_LINES 72
+#define PR_PER_PAGE 13
+static char pr_txt[PR_MAX_LINES][54];
+static int pr_n = 0;
+static int pr_page = 0;
+
+static void pr_client_cb(const usb_host_client_event_msg_t *m, void *) {
+    if (m->event == USB_HOST_CLIENT_EVENT_NEW_DEV) pr_new_addr = m->new_dev.address;
+    else if (m->event == USB_HOST_CLIENT_EVENT_DEV_GONE) pr_gone = true;
+}
+
+static void pr_add(const char *fmt, ...) {
+    if (pr_n >= PR_MAX_LINES) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(pr_txt[pr_n], sizeof pr_txt[0], fmt, ap);
+    va_end(ap);
+    ESP_LOGI(TAG, "%s", pr_txt[pr_n]);
+    pr_n++;
+}
+
+static void pr_str(const char *label, const usb_str_desc_t *sd) {
+    char b[36] = "-";
+    if (sd && sd->bLength >= 4) {
+        int n = (sd->bLength - 2) / 2;
+        if (n > 34) n = 34;
+        for (int i = 0; i < n; i++) {
+            uint16_t w = sd->wData[i];
+            b[i] = (w >= 32 && w < 127) ? (char)w : '?';
+        }
+        b[n] = 0;
+    }
+    pr_add("%s %s", label, b);
+}
+
+static void pr_describe() {
+    pr_n = 0;
+    usb_device_info_t info;
+    const usb_device_desc_t *dd = NULL;
+    if (usb_host_device_info(pr_dev, &info) != ESP_OK || usb_host_get_device_descriptor(pr_dev, &dd) != ESP_OK || !dd) {
+        pr_add("COULD NOT READ THE DEVICE DESCRIPTOR");
+        return;
+    }
+    pr_add("VID %04X  PID %04X  BCD %04X", dd->idVendor, dd->idProduct, dd->bcdDevice);
+    pr_add("CLASS %02X/%02X/%02X  EP0 %d  USB %X.%02X", dd->bDeviceClass, dd->bDeviceSubClass, dd->bDeviceProtocol,
+           dd->bMaxPacketSize0, dd->bcdUSB >> 8, dd->bcdUSB & 0xFF);
+    pr_add("SPEED %s  ADDR %d  CONFIGS %d", info.speed == USB_SPEED_LOW ? "LOW" : info.speed == USB_SPEED_FULL ? "FULL" : "HIGH",
+           info.dev_addr, dd->bNumConfigurations);
+    pr_str("MFG", info.str_desc_manufacturer);
+    pr_str("PRODUCT", info.str_desc_product);
+    pr_str("SERIAL", info.str_desc_serial_num);
+    const usb_config_desc_t *cd = NULL;
+    if (usb_host_get_active_config_descriptor(pr_dev, &cd) != ESP_OK || !cd) {
+        pr_add("NO CONFIG DESCRIPTOR");
+        return;
+    }
+    pr_add("CONFIG %d: %d IF  %d MA  %d BYTES", cd->bConfigurationValue, cd->bNumInterfaces, cd->bMaxPower * 2, cd->wTotalLength);
+    static const char *const types[] = {"CTRL", "ISO", "BULK", "INT"};
+    for (int i = 0; i < cd->bNumInterfaces; i++) {
+        for (int alt = 0; alt < 4; alt++) {
+            int off = 0;
+            const usb_intf_desc_t *id = usb_parse_interface_descriptor(cd, i, alt, &off);
+            if (!id) break;
+            pr_add("IF %d ALT %d CLASS %02X/%02X/%02X  %d EP", id->bInterfaceNumber, id->bAlternateSetting, id->bInterfaceClass,
+                   id->bInterfaceSubClass, id->bInterfaceProtocol, id->bNumEndpoints);
+            for (int e = 0; e < id->bNumEndpoints; e++) {
+                int eo = off;
+                const usb_ep_desc_t *ep = usb_parse_endpoint_descriptor_by_index(id, e, cd->wTotalLength, &eo);
+                if (!ep) break;
+                pr_add("  EP %02X %s %s  MAX %d  IVL %d", ep->bEndpointAddress, (ep->bEndpointAddress & 0x80) ? "IN" : "OUT",
+                       types[ep->bmAttributes & 3], ep->wMaxPacketSize, ep->bInterval);
+            }
+        }
+    }
+}
+
+
+// Talks to the instrument with the Argyll-derived driver (munki_argyll.cpp) and adds what it says to the pages.
+static bool pr_munki = false;
+static uint8_t pr_spos = 0xFF, pr_but = 0;
+static munki::Eeprom pr_ee;
+static munki::Spectrum pr_spec;
+static bool pr_have_spec = false;
+static munki::Mode pr_spec_mode = munki::MODE_AMBIENT;
+static const char *pr_msg = "";
+static uint8_t pr_spos_prev = 0xFF;
+static int pr_ee_state = 0;   // 0 not read, 1 checksum OK, 2 checksum BAD, 3 read failed
+static void pr_query() {
+    pr_munki = false;
+    if (!munki::open(pr_client, pr_dev)) { pr_add("MUNKI: COULD NOT CLAIM INTERFACE 0"); return; }
+    munki::Firmware f;
+    if (munki::get_firmware(&f)) {
+        pr_munki = true;
+        pr_add("MUNKI FW %d.%d  TICK %d  MININT %d", f.fw_major, f.fw_minor, f.tick_dur, f.min_int_count);
+        pr_add("EEPROM %d BLOCKS x %d BYTES", f.ee_blocks, f.ee_block_size);
+    } else {
+        pr_add("MUNKI: FIRMWARE REQUEST FAILED");
+    }
+    char v[37];
+    if (munki::get_version(v)) pr_add("VERSION %s", v);
+    pr_ee_state = 0;
+    if (pr_munki) {
+        if (!munki::read_calibration(&pr_ee)) {
+            pr_ee_state = 3;
+            pr_add("EEPROM READ FAILED (SIZE %d)", pr_ee.size);
+        } else {
+            pr_ee_state = pr_ee.sum_ok ? 1 : 2;
+            pr_add("EEPROM %d BYTES  CAL V%d (COMPAT %d)", pr_ee.size, pr_ee.cal_version, pr_ee.compat_version);
+            pr_add("CHECKSUM %08X / %08X  %s", (unsigned)pr_ee.sum_stored, (unsigned)pr_ee.sum_calc, pr_ee.sum_ok ? "OK" : "BAD");
+        }
+    }
+    uint8_t id[8];
+    if (munki::get_chip_id(id)) pr_add("CHIP %02X-%02X%02X%02X%02X%02X%02X%02X", id[0], id[1], id[2], id[3], id[4], id[5], id[6], id[7]);
+}
+
+// Instrument button: on CALIBRATION it takes the dark reference; on AMBIENT / SURFACE / PROJECTOR it measures the light
+// (ambient = diffuser, surface = open emission, projector = projector lens) and shows the 36 band spectrum on page 2.
+static void pr_show();
+static const char *mode_name(munki::Mode m) { return m == munki::MODE_AMBIENT ? "AMBIENT" : m == munki::MODE_EMISSION ? "EMISSION" : "PROJECTOR"; }
+static void pr_measure(uint8_t pos) {
+    if (pos == munki::POS_CALIB) {
+        pr_msg = "DARK CALIBRATION...";
+        pr_show();
+        pr_msg = munki::dark_calibrate() ? "" : "DARK CALIBRATION FAILED";
+        return;
+    }
+    munki::Mode mode;
+    if (pos == munki::POS_AMBIENT) mode = munki::MODE_AMBIENT;
+    else if (pos == munki::POS_SURF) mode = munki::MODE_EMISSION;
+    else if (pos == munki::POS_PROJ) mode = munki::MODE_PROJECTOR;
+    else { pr_msg = "TURN DIAL TO A MEASURING POSITION"; return; }
+    pr_msg = "MEASURING...";
+    pr_show();
+    munki::Result r = munki::measure_spectrum(mode, &pr_spec);
+    if (r == munki::MR_OK || r == munki::MR_LOW_LIGHT) {
+        pr_have_spec = true;
+        pr_spec_mode = mode;
+        pr_msg = r == munki::MR_LOW_LIGHT ? "LOW LIGHT - RESULT IS NOISY" : "";
+        pr_page = 1;
+        ESP_LOGI(TAG, "spectrum %s: T %.3f s n %d peak %d nm", mode_name(mode), pr_spec.inttime, pr_spec.nmeas, pr_spec.peak_nm);
+        for (int j = 0; j < 36; j++) ESP_LOGI(TAG, "  %d nm  %g", 380 + j * 10, pr_spec.v[j]);
+    } else {
+        pr_msg = munki::result_name(r);
+    }
+}
+
+static uint16_t wl_color(int nm) {   // rough wavelength to colour
+    double r = 0, g = 0, b = 0;
+    if (nm < 440) { r = (440 - nm) / 60.0; b = 1; }
+    else if (nm < 490) { g = (nm - 440) / 50.0; b = 1; }
+    else if (nm < 510) { g = 1; b = (510 - nm) / 20.0; }
+    else if (nm < 580) { r = (nm - 510) / 70.0; g = 1; }
+    else if (nm < 645) { r = 1; g = (645 - nm) / 65.0; }
+    else r = 1;
+    if (nm < 420) { double f = 0.3 + 0.7 * (nm - 380) / 40.0; r *= f; g *= f; b *= f; }
+    if (nm > 700) { double f = 0.3 + 0.7 * (730 - nm) / 30.0; r *= f; g *= f; b *= f; }
+    return rgb((uint8_t)(255 * r), (uint8_t)(255 * g), (uint8_t)(255 * b));
+}
+
+static void pr_plot() {
+    float mx = 0;
+    for (int j = 0; j < 36; j++) if (pr_spec.v[j] > mx) mx = pr_spec.v[j];
+    if (mx <= 0) mx = 1;
+    const int X0 = 16, BW = 8, BASE = 128, PH = 88;
+    for (int j = 0; j < 36; j++) {
+        float v = pr_spec.v[j] < 0 ? 0 : pr_spec.v[j];
+        int h = (int)(PH * v / mx);
+        fill(X0 + j * BW, BASE - h, BW - 1, h, wl_color(380 + j * 10));
+    }
+    for (int x = X0; x < X0 + 36 * BW; x++) px(x, BASE + 1, GREY);
+    text(X0, BASE + 4, "380", 1, GREY);
+    text(X0 + 17 * BW, BASE + 4, "550", 1, GREY);
+    text(X0 + 32 * BW, BASE + 4, "730", 1, GREY);
+}
+
+static void pr_frame(const char *right, uint16_t rc) {
+    clear();
+    text(6, 4, "COLORMUNKI PROBE", 2, WHITE);
+    (void)right;
+    (void)rc;
+    draw_battery();
+    for (int x = 0; x < W; x++) px(x, 22, GREY);
+}
+
+static void pr_waiting() {
+    pr_frame("", GREY);
+    text(6, 40, "PLUG IN THE COLORMUNKI", 2, YELLOW);
+    text(6, 64, "USB-C TO USB-A ADAPTER", 1, GREY);
+    textf(6, 80, 1, otg_on ? GREEN : RED, "5 V BOOST %s", otg_on ? "ON" : "OFF");
+    textf(6, 160, 1, GREY, "FW %s", FW_VERSION);
+    present();
+}
+
+// Page 0 is the big live status (when a ColorMunki answers); the USB detail pages follow it.
+static void pr_show() {
+    pr_frame("", GREY);
+    int base = pr_munki ? (pr_have_spec ? 2 : 1) : 0;
+    int dpages = pr_n ? (pr_n + PR_PER_PAGE - 1) / PR_PER_PAGE : 1;
+    int pages = base + dpages;
+    if (pr_page >= pages) pr_page = 0;
+    if (pr_munki && pr_page == 0) {
+        text(6, 28, "DIAL", 1, GREY);
+        text(6, 38, pr_spos == 0xFF ? "-" : munki::pos_name(pr_spos), 4, YELLOW);
+        textf(6, 74, 2, pr_but ? GREEN : YELLOW, "BUTTON %s", pr_but ? "PRESSED" : "-");
+        textf(6, 94, 2, munki::dark_valid() ? GREEN : GREY, "DARK CAL %s", munki::dark_valid() ? "OK" : "NEEDED");
+        if (pr_have_spec) textf(6, 112, 2, WHITE, "%s PEAK %d NM", mode_name(pr_spec_mode), pr_spec.peak_nm);
+        if (*pr_msg) text(6, 134, pr_msg, 1, RED);
+        else text(6, 134, "CAL + BUTTON = DARK CAL.  AMB/SURF/PROJ + BUTTON = MEASURE", 1, GREY);
+    } else if (pr_munki && pr_have_spec && pr_page == 1) {
+        textf(6, 28, 1, WHITE, "%s  PEAK %d NM  T %.2f S  N %d", mode_name(pr_spec_mode), pr_spec.peak_nm, pr_spec.inttime, pr_spec.nmeas);
+        pr_plot();
+        if (*pr_msg) text(6, 148, pr_msg, 1, RED);
+    } else {
+        int dp = pr_page - base;
+        for (int i = 0; i < PR_PER_PAGE; i++) {
+            int k = dp * PR_PER_PAGE + i;
+            if (k >= pr_n) break;
+            text(4, 28 + i * 9, pr_txt[k], 1, WHITE);
+        }
+    }
+    textf(4, 160, 1, GREY, "PAGE %d/%d  BUTTON = NEXT  FW %s", pr_page + 1, pages, FW_VERSION);
+    present();
+}
+
+extern "C" void app_main() {
+    gpio_config_t bi = {};
+    bi.mode = GPIO_MODE_INPUT;
+    bi.pull_up_en = GPIO_PULLUP_ENABLE;
+    bi.pin_bit_mask = (1ULL << PIN_BTN_A) | (1ULL << PIN_BTN_B);
+    gpio_config(&bi);
+
+    ESP_LOGI(TAG, "ColorMunki probe, firmware commit %s", FW_VERSION);
+    lcd_init();
+    battery_init();   // switches the 5 V boost on when nothing powers the USB-C port
+    usb_start();
+    usb_host_client_config_t cc = {};
+    cc.is_synchronous = false;
+    cc.max_num_event_msg = 5;
+    cc.async.client_event_callback = pr_client_cb;
+    cc.async.callback_arg = NULL;
+    ESP_ERROR_CHECK(usb_host_client_register(&cc, &pr_client));
+    pr_waiting();
+
+    while (true) {
+        usb_host_client_handle_events(pr_client, pdMS_TO_TICKS(100));
+        if (pr_new_addr) {
+            uint8_t addr = pr_new_addr;
+            pr_new_addr = 0;
+            if (pr_dev) {
+                usb_host_device_close(pr_client, pr_dev);
+                pr_dev = NULL;
+            }
+            if (usb_host_device_open(pr_client, addr, &pr_dev) == ESP_OK) {
+                pr_describe();
+                pr_query();
+                pr_page = 0;
+                pr_show();
+            } else {
+                pr_dev = NULL;
+                ESP_LOGW(TAG, "could not open the new USB device");
+            }
+        }
+        if (pr_gone) {
+            pr_gone = false;
+            if (pr_dev) {
+                munki::close();
+                usb_host_device_close(pr_client, pr_dev);
+                pr_dev = NULL;
+            }
+            pr_munki = false;
+            pr_waiting();
+        }
+        if (pr_dev && button_pressed()) {
+            vTaskDelay(pdMS_TO_TICKS(30));
+            if (button_pressed()) {
+                pr_page++;
+                pr_show();
+                while (button_pressed()) vTaskDelay(pdMS_TO_TICKS(20));
+            }
+        }
+        if (pr_munki && pr_dev) {   // live dial position and instrument button; button press on CALIBRATION measures
+            static uint32_t last = 0;
+            uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            if (now - last >= 100) {
+                last = now;
+                uint8_t sp, bt;
+                if (munki::get_status(&sp, &bt)) {
+                    bool press = bt && !pr_but;
+                    bool changed = (sp != pr_spos || bt != pr_but);
+                    pr_spos = sp;
+                    pr_but = bt;
+                    if (press) {
+                        pr_measure(sp);
+                        changed = true;
+                    } else if (changed && sp != pr_spos_prev && *pr_msg) {
+                        pr_msg = "";
+                    }
+                    pr_spos_prev = sp;
+                    if (changed) pr_show();
+                }
+            }
+        }
+        battery_tick();
+    }
+}
+
+#else
+// ------------------------------------------------------ ColorMunki mode ----
+// A ColorMunki Photo/Design (USB 0971:2007) plugged into the USB port is driven with the Argyll-derived driver in
+// munki_argyll.cpp. The phone sees the same Torch Bearer service: dial CALIBRATION + scan = dark calibration, dial AMBIENT +
+// scan = a reading, sent as a 1 nm spectrum interpolated from the instrument's 36 bands (380-730 nm, 10 nm).
+#include "usb/usb_helpers.h"
+#include "munki_argyll.h"
+
+static usb_host_client_handle_t mk_client = NULL;
+static usb_device_handle_t mk_dev = NULL;
+static volatile uint8_t mk_pending[4] = {0, 0, 0, 0};
+static volatile bool mk_gone = false;
+static uint8_t mk_dial = 0xFF;
+enum : uint8_t { MKR_TOO_BRIGHT = 1, MKR_COMMS = 2, MKR_NO_DARK = 3, MKR_NO_DATA = 4, MKR_WRONG_DIAL = 5, MKR_CAL_FAILED = 6 };
+static uint8_t mk_reason = 0;
+static const char *mk_msg = "";
+
+static void mk_client_cb(const usb_host_client_event_msg_t *e, void *) {
+    if (e->event == USB_HOST_CLIENT_EVENT_NEW_DEV) {
+        for (int i = 0; i < 4; i++) if (!mk_pending[i]) { mk_pending[i] = e->new_dev.address; break; }
+    } else if (e->event == USB_HOST_CLIENT_EVENT_DEV_GONE) {
+        if (mk_dev && e->dev_gone.dev_hdl == mk_dev) mk_gone = true;
+    }
+}
+
+static void mk_init() {
+    usb_host_client_config_t cc = {};
+    cc.is_synchronous = false;
+    cc.max_num_event_msg = 5;
+    cc.async.client_event_callback = mk_client_cb;
+    cc.async.callback_arg = NULL;
+    if (usb_host_client_register(&cc, &mk_client) != ESP_OK) { mk_client = NULL; return; }
+    uint8_t list[8];
+    int n = 0;
+    if (usb_host_device_addr_list_fill(sizeof list, list, &n) == ESP_OK)   // devices already attached at boot
+        for (int i = 0; i < n && i < 4; i++) mk_pending[i] = list[i];
+}
+
+static uint16_t mk_age_min() {
+    uint32_t s = munki::dark_age_s();
+    if (s == 0xFFFFFFFFu) return 0xFFFF;
+    uint32_t m = s / 60;
+    return (uint16_t)(m > 0xFFFE ? 0xFFFE : m);
+}
+
+static uint8_t mk_flags_now() {
+    return (uint8_t)((mk_dial <= 3 ? (0x80 | mk_dial) : 0) | (munki::dark_valid() ? 0x04 : 0));
+}
+
+// Looks at newly attached devices; returns true once a ColorMunki is open and its calibration data is read.
+static bool mk_try_open() {
+    if (!mk_client) return false;
+    usb_host_client_handle_events(mk_client, 0);
+    for (int i = 0; i < 4; i++) {
+        uint8_t a = mk_pending[i];
+        if (!a) continue;
+        mk_pending[i] = 0;
+        usb_device_handle_t d = NULL;
+        if (usb_host_device_open(mk_client, a, &d) != ESP_OK) continue;
+        const usb_device_desc_t *dd = NULL;
+        if (usb_host_get_device_descriptor(d, &dd) != ESP_OK || !dd || dd->idVendor != 0x0971 || dd->idProduct != 0x2007) {
+            usb_host_device_close(mk_client, d);
+            continue;
+        }
+        mk_dev = d;
+        mk_gone = false;
+        munki::Eeprom ee;
+        munki::Firmware fw;
+        if (munki::open(mk_client, mk_dev) && munki::get_firmware(&fw) && munki::read_calibration(&ee) && ee.sum_ok) {
+            ESP_LOGI(TAG, "ColorMunki: firmware %d.%d, calibration %d bytes (v%d)", fw.fw_major, fw.fw_minor, ee.size, ee.cal_version);
+            return true;
+        }
+        ESP_LOGW(TAG, "ColorMunki found but could not be read");
+        munki::close();
+        usb_host_device_close(mk_client, mk_dev);
+        mk_dev = NULL;
+    }
+    return false;
+}
+
+// 36 bands at 10 nm -> 351 points at 1 nm (Catmull-Rom, clamped at zero), the grid the rest of the bridge and the app use.
+// The ColorMunki code yields mW/m^2/nm; the app (like the Torch Bearer path) expects W/m^2/nm, hence MK_UNITS.
+static const float MK_UNITS = 0.001f;
+static void mk_fill_scan(const munki::Spectrum &s, bool low_light) {
+    scan.start_nm = 380;
+    scan.npts = 351;
+    scan.exposure_ms = (float)(s.inttime * 1000.0);
+    scan.status = low_light ? 2 : 0;
+    for (int i = 0; i < 351; i++) {
+        int seg = i / 10;
+        float t = (i % 10) / 10.0f;
+        if (seg >= 35) { scan.spd[i] = (s.v[35] < 0 ? 0 : s.v[35]) * MK_UNITS; continue; }
+        float p0 = s.v[seg > 0 ? seg - 1 : 0], p1 = s.v[seg], p2 = s.v[seg + 1], p3 = s.v[seg + 2 < 36 ? seg + 2 : 35];
+        float v = 0.5f * ((2 * p1) + (-p0 + p2) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t * t + (-p0 + 3 * p1 - 3 * p2 + p3) * t * t * t);
+        scan.spd[i] = (v < 0 ? 0 : v) * MK_UNITS;
+    }
+}
+
+static const char *mk_dial_name(uint8_t d) {
+    return d == munki::POS_CALIB ? "CALIBRATION" : d == munki::POS_AMBIENT ? "AMBIENT" : d == munki::POS_SURF ? "SURFACE" : d == munki::POS_PROJ ? "PROJECTOR" : "-";
+}
+
+static void ui_munki_ready() {
+    clear();
+    shown = 1;
+    header("READY", GREEN);
+    text(6, 30, "DIAL", 1, GREY);
+    text(6, 40, mk_dial_name(mk_dial), 3, YELLOW);
+    bool dv = munki::dark_valid();
+    text(6, 70, dv ? "CALIBRATED" : "NOT CALIBRATED", 2, dv ? GREEN : YELLOW);
+    if (*mk_msg) text(6, 94, mk_msg, 1, RED);
+    else if (mk_dial == munki::POS_CALIB) text(6, 94, "PRESS BUTTON TO CALIBRATE", 1, CYAN);
+    else if (mk_dial == munki::POS_AMBIENT) text(6, 94, dv ? "PRESS BUTTON TO MEASURE" : "CALIBRATE FIRST (DIAL TO CALIBRATION)", 1, dv ? WHITE : YELLOW);
+    else text(6, 94, "SET THE DIAL TO AMBIENT (OR CALIBRATION)", 1, RED);
+    draw_btn_note();
+    draw_btn_arrow();
+    textf(arrow_bottom_left() ? 18 : 6, 160, 1, GREY, "FW %s", FW_VERSION);
+    present();
+}
+
+static void ui_munki_busy(const char *what) {
+    clear();
+    header("WORKING", YELLOW);
+    text(10, 60, what, 2, WHITE);
+    text(10, 90, "KEEP THE DIAL STILL", 1, GREY);
+    present();
+}
+
+static void mk_fail(uint8_t reason, const char *msg) {
+    mk_reason = reason;
+    mk_msg = msg;
+    ble_status(5, reason, 0);
+    ui_munki_ready();
+    // Let the phone see the failure, then go back to ready so a later
+    // connection does not start out reading a stale error.
+    vTaskDelay(pdMS_TO_TICKS(300));
+    ble_status(0, 0, 0);
+}
+
+static void mk_do(uint8_t dial) {
+    mk_msg = "";
+    if (dial == munki::POS_CALIB) {
+        ble_status(1, 0, 0);
+        ui_munki_busy("CALIBRATING...");
+        bool ok = munki::dark_calibrate();
+        mk_dial = dial;
+        meter_flags = mk_flags_now();
+        if (!ok) { mk_fail(MKR_CAL_FAILED, munki::last_error()); return; }
+        ble_status(0, 0, 0);
+        ui_munki_ready();
+    } else if (dial == munki::POS_AMBIENT) {
+        if (!munki::dark_valid()) { mk_fail(MKR_NO_DARK, "CALIBRATE FIRST (DIAL TO CALIBRATION)"); return; }
+        ble_status(1, 0, 0);
+        ui_munki_busy("MEASURING...");
+        munki::Spectrum s;
+        munki::Result r = munki::measure_spectrum(munki::MODE_AMBIENT, &s);
+        if (r == munki::MR_OK || r == munki::MR_LOW_LIGHT) {
+            mk_fill_scan(s, r == munki::MR_LOW_LIGHT);
+            have_result = true;
+            ui_result(true);
+            ble_status(2, 0, scan.exposure_ms);
+            ble_send_result();
+        } else if (r == munki::MR_TOO_BRIGHT) mk_fail(MKR_TOO_BRIGHT, "TOO BRIGHT");
+        else if (r == munki::MR_NO_DARK) mk_fail(MKR_NO_DARK, "CALIBRATE FIRST (DIAL TO CALIBRATION)");
+        else if (r == munki::MR_COMMS) mk_fail(MKR_COMMS, munki::last_error());
+        else mk_fail(MKR_NO_DATA, "MEASUREMENT FAILED");
+    } else {
+        mk_fail(MKR_WRONG_DIAL, "SET THE DIAL TO AMBIENT (OR CALIBRATION)");
+    }
+}
+
+// Runs while a ColorMunki is attached; returns when it is unplugged.
+static void mk_session() {
+    meter_kind = 1;
+    meter_cal_age_min = mk_age_min;
+    strncpy(device_id, "COLORMUNKI", sizeof device_id);
+    range_lo = 380;
+    range_hi = 730;
+    mk_dial = 0xFF;
+    mk_msg = "";
+    meter_flags = mk_flags_now();
+    ble_status(0, 0, 0);
+    ui_munki_ready();
+    uint8_t bt_prev = 0;
+    int fails = 0;
+    while (!mk_gone && fails < 5) {
+        uint8_t sp = 0xFF, bt = 0;
+        if (munki::get_status(&sp, &bt)) fails = 0; else { fails++; sp = mk_dial; }
+        bool dial_changed = sp != mk_dial;
+        if (dial_changed) {
+            mk_dial = sp;
+            mk_msg = "";
+        }
+        uint8_t fl = mk_flags_now();
+        if (fl != meter_flags) {
+            meter_flags = fl;
+            ble_status_refresh();
+        }
+        bool trigger = false, from_button = false;
+        if (ble_scan_req) trigger = true;
+        else if (bt && !bt_prev) trigger = true;
+        else if (button_pressed()) {
+            vTaskDelay(pdMS_TO_TICKS(30));
+            trigger = from_button = button_pressed();
+            if (trigger) { btn_seen = button_mask(); btn_note(btn_seen); }
+        }
+        bt_prev = bt;
+        if (ble_resend_req) { ble_resend_req = false; ble_send_result(); }
+        if (trigger) {
+            ble_scan_req = false;
+            mk_do(mk_dial);
+            meter_flags = mk_flags_now();
+            ble_status_refresh();
+            if (from_button) while (button_pressed()) vTaskDelay(pdMS_TO_TICKS(20));
+            bt_prev = 1;   // don't re-trigger on an instrument button still held
+        } else if (dial_changed && shown == 1) {
+            ui_munki_ready();
+        }
+        flip_tick();
+        btn_tick();
+        battery_tick();
+        link_tick();
+        vTaskDelay(pdMS_TO_TICKS(60));
+    }
+    munki::close();
+    if (mk_dev) { usb_host_device_close(mk_client, mk_dev); mk_dev = NULL; }
+    meter_kind = 0;
+    meter_cal_age_min = NULL;
+    meter_flags = 0;
+    device_id[0] = 0;
+    range_lo = 340;
+    range_hi = 1000;
+    have_result = false;
+}
+
 // -------------------------------------------------------------- main ----
 extern "C" void app_main() {
     gpio_config_t bi = {};
@@ -1237,13 +1824,18 @@ extern "C" void app_main() {
     lcd_init();
     battery_init();
     usb_start();
+    mk_init();
     ble_start();
     ui_waiting();
 
     while (true) {
-        // 1. wait for the spectrometer
+        // 1. wait for the spectrometer (or a ColorMunki)
         while (!usb_connected) {
-            if (usb_try_open() && tb_init()) {
+            if (mk_try_open()) {
+                mk_session();
+                ui_waiting();
+                ble_status(3, 0, 0);
+            } else if (usb_try_open() && tb_init()) {
                 usb_connected = true;
                 ESP_LOGI(TAG, "connected: %s  %d-%d nm", device_id, range_lo, range_hi);
             } else {
@@ -1300,3 +1892,5 @@ extern "C" void app_main() {
         ble_status(3, 0, 0);
     }
 }
+
+#endif  // COLORMUNKI_PROBE
