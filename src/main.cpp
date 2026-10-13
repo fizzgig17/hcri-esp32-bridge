@@ -1021,10 +1021,31 @@ static void link_tick() {
 }
 
 // ----------------------------------------------------------------- UI ----
-// A small yellow arrow pointing at the scan button, which is off the right edge, level with the top of the screen; flipped,
-// it is off the left edge, level with the bottom. Drawn on the READY and result screens.
+// A small yellow arrow pointing at the scan button on the READY and result screens. The button sits at a different
+// corner on each board. T-Display S3: off the right edge near the top, so the arrow is top-right pointing right
+// (flipped: bottom-left pointing left). T-Display-S3 Pro: below the bottom-left corner, so the arrow is bottom-left
+// pointing down (flipped: top-right pointing up).
+static inline bool arrow_bottom_left() {
+#ifdef BOARD_PRO
+    return !flipped;
+#else
+    return flipped;
+#endif
+}
+
 static void draw_btn_arrow() {
-    if (!flipped) {
+#ifdef BOARD_PRO
+    if (!arrow_bottom_left()) {
+        const int cx = 312;
+        for (int i = 0; i <= 5; i++) fill(cx - i, 3 + i, 2 * i + 1, 1, YELLOW);   // head, tip at the top
+        fill(cx - 1, 9, 3, 8, YELLOW);                                              // shaft
+    } else {
+        const int cx = 8;
+        for (int i = 0; i <= 5; i++) fill(cx - i, 166 - i, 2 * i + 1, 1, YELLOW); // head, tip at the bottom
+        fill(cx - 1, 153, 3, 8, YELLOW);
+    }
+#else
+    if (!arrow_bottom_left()) {
         const int tip = 318, cy = 11;
         for (int i = 0; i <= 5; i++) fill(tip - i, cy - i, 1, 2 * i + 1, YELLOW);   // head, pointing right
         fill(tip - 13, cy - 1, 8, 3, YELLOW);                                        // shaft
@@ -1033,12 +1054,13 @@ static void draw_btn_arrow() {
         for (int i = 0; i <= 5; i++) fill(tip + i, cy - i, 1, 2 * i + 1, YELLOW);   // head, pointing left
         fill(tip + 6, cy - 1, 8, 3, YELLOW);
     }
+#endif
 }
 
 static void header(const char *right, uint16_t rc) {
     text(6, 4, "TORCH BEARER", 2, WHITE);
     // On the arrow screens the upright arrow owns the top-right corner, so the right-hand status steps left of it.
-    int edge = (shown != 0 && !flipped) ? W - 24 : W - 6;
+    int edge = (shown != 0 && !arrow_bottom_left()) ? W - 24 : W - 6;
     text(edge - (int)strlen(right) * 12, 4, right, 2, rc);
     draw_battery();
     for (int x = 0; x < W; x++) px(x, 22, GREY);
@@ -1065,7 +1087,7 @@ static void ui_ready() {
     text(20, 84, "PRESS BUTTON", 2, WHITE);
     text(20, 104, "TO SCAN", 2, WHITE);
     draw_btn_arrow();
-    textf(flipped ? 18 : 6, 160, 1, GREY, "FW %s", FW_VERSION);
+    textf(arrow_bottom_left() ? 18 : 6, 160, 1, GREY, "FW %s", FW_VERSION);
     diag_on = true;
     draw_diag();
     present();
@@ -1126,7 +1148,7 @@ static void ui_result(bool ok) {
         int pkx = pk * (pw - 1) / (n - 1);
         vline(px0 + pkx, py0, py0 + ph, YELLOW);
     }
-    textf(flipped ? px0 + 8 : px0, 162, 1, GREY, "%d", range_lo);   // steps right of the flipped arrow
+    textf(arrow_bottom_left() ? px0 + 8 : px0, 162, 1, GREY, "%d", range_lo);   // steps right of the flipped arrow
     draw_btn_arrow();
     textf(px0 + pw / 2 - 9, 162, 1, GREY, "%d", (range_lo + range_hi) / 2);
     textf(px0 + pw - 24, 162, 1, GREY, "%d", range_hi);
