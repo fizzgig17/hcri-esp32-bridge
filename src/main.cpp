@@ -1239,7 +1239,7 @@ static usb_device_handle_t pr_dev = NULL;
 static volatile uint8_t pr_new_addr = 0;
 static volatile bool pr_gone = false;
 #define PR_MAX_LINES 72
-#define PR_PER_PAGE 14
+#define PR_PER_PAGE 13
 static char pr_txt[PR_MAX_LINES][54];
 static int pr_n = 0;
 static int pr_page = 0;
