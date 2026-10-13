@@ -96,6 +96,40 @@ static const int PIN_LCD_D[8] = {39, 40, 41, 42, 45, 46, 47, 48};
 static uint16_t *fb;  // W*H RGB565, byte-swapped for the panel
 static esp_lcd_panel_handle_t panel;
 
+// Display orientation. The default has the text upright with the USB-C end on the right; "flipped" is that turned
+// 180 degrees. It is chosen from the app (BLE command 0x03) and kept in flash so it survives a power cycle.
+static bool nvs_ready = false;
+static void nvs_boot() {
+    if (nvs_ready) return;
+    esp_err_t r = nvs_flash_init();
+    if (r == ESP_ERR_NVS_NO_FREE_PAGES || r == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        nvs_flash_init();
+    }
+    nvs_ready = true;
+}
+static bool flip_load() {
+    nvs_boot();
+    nvs_handle_t h;
+    uint8_t v = 0;
+    if (nvs_open("hcri", NVS_READONLY, &h) == ESP_OK) {
+        nvs_get_u8(h, "flip", &v);
+        nvs_close(h);
+    }
+    return v != 0;
+}
+static void flip_save(bool f) {
+    nvs_boot();
+    nvs_handle_t h;
+    if (nvs_open("hcri", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, "flip", f ? 1 : 0);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+static bool flipped = false;                // what the panel is set to now
+static volatile int8_t flip_req = -1;       // -1 none, else 0/1 asked for by the phone
+
 static inline uint16_t rgb(uint8_t r, uint8_t g, uint8_t b) {
     uint16_t c = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
     return __builtin_bswap16(c);
@@ -118,6 +152,9 @@ static void st_cmd(uint8_t c, const uint8_t *d = nullptr, size_t n = 0) {
     ESP_ERROR_CHECK(esp_lcd_panel_io_tx_param(lcd_io, c, d, n));
 }
 static void st_cmd1(uint8_t c, uint8_t v) { st_cmd(c, &v, 1); }
+
+// MADCTL: 0xA8 = landscape with the USB-C end on the right, 0x68 = turned 180 degrees (the glass is centred, so the column offset is the same).
+static void apply_flip(bool f) { st_cmd1(0x36, f ? 0x68 : 0xA8); }
 
 // Write a w*h block of RGB565 to the landscape position (x, y).
 static void blit(int x, int y, int w, int h, const void *data) {
@@ -178,7 +215,8 @@ static void lcd_init() {
     vTaskDelay(pdMS_TO_TICKS(120));
     st_cmd(0x38);
     st_cmd(0x21);                                  // IPS panel: inversion on
-    st_cmd1(0x36, 0xA8);                           // landscape, turned 180 degrees (MY | MV | BGR) so the USB-C end is on the right (0x68 = the other way up); the glass is centred, so the column offset is the same
+    flipped = flip_load();
+    apply_flip(flipped);                           // landscape (MY | MV | BGR), see apply_flip
     st_cmd(0x29);                                  // display on
 
     fb = (uint16_t *)heap_caps_malloc(W * H * 2, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
@@ -198,6 +236,9 @@ static void present() {
     vTaskDelay(pdMS_TO_TICKS(40));  // let the DMA finish before fb is touched again
 }
 #else
+// Turned 180 degrees = both mirrors swapped.
+static void apply_flip(bool f) { esp_lcd_panel_mirror(panel, !f, f); }
+
 static void lcd_init() {
     gpio_config_t o = {};
     o.mode = GPIO_MODE_OUTPUT;
@@ -240,10 +281,11 @@ static void lcd_init() {
     esp_lcd_panel_init(panel);
     esp_lcd_panel_invert_color(panel, true);
     esp_lcd_panel_swap_xy(panel, true);
-    // Turned 180 degrees from before: the text reads upright with the USB-C end on the RIGHT, so the buttons sit at the
-    // right edge (the READY arrow points up and to the right at the top one). The 35-pixel gap is the same either way
-    // (the 170-pixel-high glass sits centred in the controller's 240 rows).
-    esp_lcd_panel_mirror(panel, true, false);
+    // Default: the text reads upright with the USB-C end on the RIGHT, so the buttons sit at the right edge (the READY
+    // arrow points up and to the right at the top one). The 35-pixel gap is the same either way (the 170-pixel-high
+    // glass sits centred in the controller's 240 rows).
+    flipped = flip_load();
+    apply_flip(flipped);
     esp_lcd_panel_set_gap(panel, 0, 35);
     esp_lcd_panel_disp_on_off(panel, true);
 
@@ -262,7 +304,8 @@ static void present() {
 
 #endif
 
-static void clear() { memset(fb, 0, W * H * 2); }
+static bool ready_shown = false;  // the READY screen is what's on show (its arrow depends on the orientation)
+static void clear() { memset(fb, 0, W * H * 2); ready_shown = false; }
 
 static inline void px(int x, int y, uint16_t c) {
     if (x >= 0 && x < W && y >= 0 && y < H) fb[y * W + x] = c;
@@ -885,6 +928,10 @@ static int ble_access_cb(uint16_t, uint16_t, struct ble_gatt_access_ctxt *ctxt, 
         if (OS_MBUF_PKTLEN(ctxt->om) >= 1 && os_mbuf_copydata(ctxt->om, 0, 1, &cmd) == 0) {
             if (cmd == 0x01) ble_scan_req = true;
             if (cmd == 0x02) ble_resend_req = true;
+            if (cmd == 0x03) {  // 0x03 <0|1>: display orientation, 1 = turned 180 degrees
+                uint8_t v = 0;
+                if (OS_MBUF_PKTLEN(ctxt->om) >= 2 && os_mbuf_copydata(ctxt->om, 1, 1, &v) == 0) flip_req = v ? 1 : 0;
+            }
         }
         return 0;
     }
@@ -910,11 +957,7 @@ static void ble_host_task(void *) {
     nimble_port_freertos_deinit();
 }
 static void ble_start() {
-    esp_err_t r = nvs_flash_init();
-    if (r == ESP_ERR_NVS_NO_FREE_PAGES || r == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        nvs_flash_erase();
-        nvs_flash_init();
-    }
+    nvs_boot();
     ESP_ERROR_CHECK(nimble_port_init());
     ble_hs_cfg.sync_cb = ble_on_sync;
     ble_svc_gap_init();
@@ -1001,12 +1044,22 @@ static void ui_ready() {
     header("READY", GREEN);
     text(6, 32, device_id, 1, GREY);
     textf(6, 48, 1, GREY, "RANGE %d-%d NM", range_lo, range_hi);
-    text(20, 84, "PRESS BUTTON", 2, WHITE);
-    text(20, 104, "TO SCAN", 2, WHITE);
-    // Arrow up and to the right: the button is just above the top-right corner of the screen.
-    thick_line(196, 120, 280, 36, 4, YELLOW);
-    thick_line(280, 36, 262, 36, 4, YELLOW);
-    thick_line(280, 36, 280, 54, 4, YELLOW);
+    ready_shown = true;
+    if (!flipped) {
+        text(20, 84, "PRESS BUTTON", 2, WHITE);
+        text(20, 104, "TO SCAN", 2, WHITE);
+        // Arrow up and to the right: the button is just above the top-right corner of the screen.
+        thick_line(196, 120, 280, 36, 4, YELLOW);
+        thick_line(280, 36, 262, 36, 4, YELLOW);
+        thick_line(280, 36, 280, 54, 4, YELLOW);
+    } else {
+        // Turned 180 degrees, the button is below the bottom-left corner: the text moves right and the arrow points down and to the left.
+        text(160, 84, "PRESS BUTTON", 2, WHITE);
+        text(160, 104, "TO SCAN", 2, WHITE);
+        thick_line(130, 62, 36, 140, 4, YELLOW);
+        thick_line(36, 140, 54, 140, 4, YELLOW);
+        thick_line(36, 140, 36, 122, 4, YELLOW);
+    }
     textf(6, 160, 1, GREY, "FW %s", FW_VERSION);
     diag_on = true;
     draw_diag();
@@ -1072,6 +1125,20 @@ static void ui_result(bool ok) {
     present();
 }
 
+// Apply an orientation asked for over BLE: turn the panel, remember it, and redraw the frame buffer the new way up.
+static void flip_tick() {
+    int8_t r = flip_req;
+    if (r < 0) return;
+    flip_req = -1;
+    bool f = r != 0;
+    if (f == flipped) return;
+    flipped = f;
+    apply_flip(f);
+    flip_save(f);
+    if (ready_shown) ui_ready();  // redraws and presents, with the arrow on the other side
+    else present();
+}
+
 static bool button_pressed() {
     return gpio_get_level((gpio_num_t)PIN_BTN_A) == 0 || gpio_get_level((gpio_num_t)PIN_BTN_B) == 0;
 }
@@ -1100,6 +1167,7 @@ extern "C" void app_main() {
             } else {
                 vcp.reset();
                 if (ble_scan_req) { ble_scan_req = false; ble_status(3, 0, 0); }
+                flip_tick();
                 battery_tick();
                 link_tick();
                 vTaskDelay(pdMS_TO_TICKS(500));
@@ -1134,6 +1202,7 @@ extern "C" void app_main() {
                 if (from_button) while (button_pressed()) vTaskDelay(pdMS_TO_TICKS(20));
                 // result stays on screen; the next press or BLE command starts a new scan
             }
+            flip_tick();
             battery_tick();
             link_tick();
             vTaskDelay(pdMS_TO_TICKS(20));
