@@ -178,7 +178,7 @@ static void lcd_init() {
     vTaskDelay(pdMS_TO_TICKS(120));
     st_cmd(0x38);
     st_cmd(0x21);                                  // IPS panel: inversion on
-    st_cmd1(0x36, 0x68);                           // landscape (MX | MV | BGR); if the picture is upside down try 0xA8
+    st_cmd1(0x36, 0xA8);                           // landscape, turned 180 degrees (MY | MV | BGR) so the USB-C end is on the right (0x68 = the other way up); the glass is centred, so the column offset is the same
     st_cmd(0x29);                                  // display on
 
     fb = (uint16_t *)heap_caps_malloc(W * H * 2, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
@@ -240,7 +240,10 @@ static void lcd_init() {
     esp_lcd_panel_init(panel);
     esp_lcd_panel_invert_color(panel, true);
     esp_lcd_panel_swap_xy(panel, true);
-    esp_lcd_panel_mirror(panel, false, true);
+    // Turned 180 degrees from before: the text reads upright with the USB-C end on the RIGHT, so the buttons sit at the
+    // right edge (the READY arrow points up and to the right at the top one). The 35-pixel gap is the same either way
+    // (the 170-pixel-high glass sits centred in the controller's 240 rows).
+    esp_lcd_panel_mirror(panel, true, false);
     esp_lcd_panel_set_gap(panel, 0, 35);
     esp_lcd_panel_disp_on_off(panel, true);
 
