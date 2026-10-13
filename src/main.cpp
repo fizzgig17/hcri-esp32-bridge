@@ -1632,6 +1632,8 @@ static bool mk_try_open() {
 }
 
 // 36 bands at 10 nm -> 351 points at 1 nm (Catmull-Rom, clamped at zero), the grid the rest of the bridge and the app use.
+// The ColorMunki code yields mW/m^2/nm; the app (like the Torch Bearer path) expects W/m^2/nm, hence MK_UNITS.
+static const float MK_UNITS = 0.001f;
 static void mk_fill_scan(const munki::Spectrum &s, bool low_light) {
     scan.start_nm = 380;
     scan.npts = 351;
@@ -1640,10 +1642,10 @@ static void mk_fill_scan(const munki::Spectrum &s, bool low_light) {
     for (int i = 0; i < 351; i++) {
         int seg = i / 10;
         float t = (i % 10) / 10.0f;
-        if (seg >= 35) { scan.spd[i] = s.v[35] < 0 ? 0 : s.v[35]; continue; }
+        if (seg >= 35) { scan.spd[i] = (s.v[35] < 0 ? 0 : s.v[35]) * MK_UNITS; continue; }
         float p0 = s.v[seg > 0 ? seg - 1 : 0], p1 = s.v[seg], p2 = s.v[seg + 1], p3 = s.v[seg + 2 < 36 ? seg + 2 : 35];
         float v = 0.5f * ((2 * p1) + (-p0 + p2) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t * t + (-p0 + 3 * p1 - 3 * p2 + p3) * t * t * t);
-        scan.spd[i] = v < 0 ? 0 : v;
+        scan.spd[i] = (v < 0 ? 0 : v) * MK_UNITS;
     }
 }
 
