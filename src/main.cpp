@@ -1319,10 +1319,11 @@ static void pr_describe() {
 static bool pr_munki = false;
 static uint8_t pr_spos = 0xFF, pr_but = 0;
 static munki::Eeprom pr_ee;
-static munki::Raw pr_dark, pr_white;
-static bool pr_have_dark = false, pr_have_white = false;
+static munki::Spectrum pr_spec;
+static bool pr_have_spec = false;
+static munki::Mode pr_spec_mode = munki::MODE_AMBIENT;
 static const char *pr_msg = "";
-static double pr_sat = 0;
+static uint8_t pr_spos_prev = 0xFF;
 static int pr_ee_state = 0;   // 0 not read, 1 checksum OK, 2 checksum BAD, 3 read failed
 static void pr_query() {
     pr_munki = false;
@@ -1352,27 +1353,64 @@ static void pr_query() {
     if (munki::get_chip_id(id)) pr_add("CHIP %02X-%02X%02X%02X%02X%02X%02X%02X", id[0], id[1], id[2], id[3], id[4], id[5], id[6], id[7]);
 }
 
-// Dial on CALIBRATION + instrument button: a dark reading (lamp off), then a white-tile reading (lamp on, after the
-// LED settling readings the instrument asks for). Shows raw counts only; turning them into a spectrum is stage 4.
+// Instrument button: on CALIBRATION it takes the dark reference; on AMBIENT / SURFACE / PROJECTOR it measures the light
+// (ambient = diffuser, surface = open emission, projector = projector lens) and shows the 36 band spectrum on page 2.
 static void pr_show();
-static void pr_measure() {
-    munki::Params p;
-    if (!munki::get_params(&p)) { pr_msg = "NO CALIBRATION DATA"; return; }
-    pr_sat = p.sat_limit;
-    pr_have_dark = pr_have_white = false;
-    pr_msg = "MEASURING DARK...";
+static const char *mode_name(munki::Mode m) { return m == munki::MODE_AMBIENT ? "AMBIENT" : m == munki::MODE_EMISSION ? "EMISSION" : "PROJECTOR"; }
+static void pr_measure(uint8_t pos) {
+    if (pos == munki::POS_CALIB) {
+        pr_msg = "DARK CALIBRATION...";
+        pr_show();
+        pr_msg = munki::dark_calibrate() ? "" : "DARK CALIBRATION FAILED";
+        return;
+    }
+    munki::Mode mode;
+    if (pos == munki::POS_AMBIENT) mode = munki::MODE_AMBIENT;
+    else if (pos == munki::POS_SURF) mode = munki::MODE_EMISSION;
+    else if (pos == munki::POS_PROJ) mode = munki::MODE_PROJECTOR;
+    else { pr_msg = "TURN DIAL TO A MEASURING POSITION"; return; }
+    pr_msg = "MEASURING...";
     pr_show();
-    double it = p.cal_int_time;
-    if (!munki::measure_raw(false, it, 0, 4, &pr_dark)) { pr_msg = "DARK READING FAILED"; return; }
-    pr_have_dark = true;
-    pr_msg = "MEASURING WHITE...";
-    pr_show();
-    int ninv = (int)(p.invalid_s / it) + 1;
-    if (!munki::measure_raw(true, it, ninv, 4, &pr_white)) { pr_msg = "WHITE READING FAILED"; return; }
-    pr_have_white = true;
-    pr_msg = pr_white.max >= p.sat_limit ? "WHITE IS SATURATED" : "";
-    ESP_LOGI(TAG, "dark: shielded %.1f mean %.1f max %.1f | white: shielded %.1f mean %.1f max %.1f led %.0f | int %.4f s ninv %d sat %.0f",
-             pr_dark.shielded, pr_dark.mean, pr_dark.max, pr_white.shielded, pr_white.mean, pr_white.max, pr_white.led, it, ninv, p.sat_limit);
+    munki::Result r = munki::measure_spectrum(mode, &pr_spec);
+    if (r == munki::R_OK || r == munki::R_LOW_LIGHT) {
+        pr_have_spec = true;
+        pr_spec_mode = mode;
+        pr_msg = r == munki::R_LOW_LIGHT ? "LOW LIGHT - RESULT IS NOISY" : "";
+        pr_page = 1;
+        ESP_LOGI(TAG, "spectrum %s: T %.3f s n %d peak %d nm", mode_name(mode), pr_spec.inttime, pr_spec.nmeas, pr_spec.peak_nm);
+        for (int j = 0; j < 36; j++) ESP_LOGI(TAG, "  %d nm  %g", 380 + j * 10, pr_spec.v[j]);
+    } else {
+        pr_msg = munki::result_name(r);
+    }
+}
+
+static uint16_t wl_color(int nm) {   // rough wavelength to colour
+    double r = 0, g = 0, b = 0;
+    if (nm < 440) { r = (440 - nm) / 60.0; b = 1; }
+    else if (nm < 490) { g = (nm - 440) / 50.0; b = 1; }
+    else if (nm < 510) { g = 1; b = (510 - nm) / 20.0; }
+    else if (nm < 580) { r = (nm - 510) / 70.0; g = 1; }
+    else if (nm < 645) { r = 1; g = (645 - nm) / 65.0; }
+    else r = 1;
+    if (nm < 420) { double f = 0.3 + 0.7 * (nm - 380) / 40.0; r *= f; g *= f; b *= f; }
+    if (nm > 700) { double f = 0.3 + 0.7 * (730 - nm) / 30.0; r *= f; g *= f; b *= f; }
+    return rgb((uint8_t)(255 * r), (uint8_t)(255 * g), (uint8_t)(255 * b));
+}
+
+static void pr_plot() {
+    float mx = 0;
+    for (int j = 0; j < 36; j++) if (pr_spec.v[j] > mx) mx = pr_spec.v[j];
+    if (mx <= 0) mx = 1;
+    const int X0 = 16, BW = 8, BASE = 128, PH = 88;
+    for (int j = 0; j < 36; j++) {
+        float v = pr_spec.v[j] < 0 ? 0 : pr_spec.v[j];
+        int h = (int)(PH * v / mx);
+        fill(X0 + j * BW, BASE - h, BW - 1, h, wl_color(380 + j * 10));
+    }
+    for (int x = X0; x < X0 + 36 * BW; x++) px(x, BASE + 1, GREY);
+    text(X0, BASE + 4, "380", 1, GREY);
+    text(X0 + 17 * BW, BASE + 4, "550", 1, GREY);
+    text(X0 + 32 * BW, BASE + 4, "730", 1, GREY);
 }
 
 static void pr_frame(const char *right, uint16_t rc) {
@@ -1396,7 +1434,7 @@ static void pr_waiting() {
 // Page 0 is the big live status (when a ColorMunki answers); the USB detail pages follow it.
 static void pr_show() {
     pr_frame("", GREY);
-    int base = pr_munki ? 1 : 0;
+    int base = pr_munki ? (pr_have_spec ? 2 : 1) : 0;
     int dpages = pr_n ? (pr_n + PR_PER_PAGE - 1) / PR_PER_PAGE : 1;
     int pages = base + dpages;
     if (pr_page >= pages) pr_page = 0;
@@ -1404,11 +1442,14 @@ static void pr_show() {
         text(6, 28, "DIAL", 1, GREY);
         text(6, 38, pr_spos == 0xFF ? "-" : munki::pos_name(pr_spos), 4, YELLOW);
         textf(6, 74, 2, pr_but ? GREEN : YELLOW, "BUTTON %s", pr_but ? "PRESSED" : "-");
-        if (pr_have_dark) textf(6, 94, 2, WHITE, "DARK  AVG %.0f MAX %.0f", pr_dark.mean, pr_dark.max);
-        if (pr_have_white) textf(6, 112, 2, WHITE, "WHITE AVG %.0f MAX %.0f", pr_white.mean, pr_white.max);
+        textf(6, 94, 2, munki::dark_valid() ? GREEN : GREY, "DARK CAL %s", munki::dark_valid() ? "OK" : "NEEDED");
+        if (pr_have_spec) textf(6, 112, 2, WHITE, "%s PEAK %d NM", mode_name(pr_spec_mode), pr_spec.peak_nm);
         if (*pr_msg) text(6, 134, pr_msg, 1, RED);
-        else textf(6, 134, 1, GREY, "EEPROM %s  DIAL TO CAL + MUNKI BUTTON = MEASURE",
-                   pr_ee_state == 1 ? "OK" : pr_ee_state == 2 ? "BAD" : pr_ee_state == 3 ? "FAIL" : "-");
+        else text(6, 134, "CAL + BUTTON = DARK CAL.  AMB/SURF/PROJ + BUTTON = MEASURE", 1, GREY);
+    } else if (pr_munki && pr_have_spec && pr_page == 1) {
+        textf(6, 28, 1, WHITE, "%s  PEAK %d NM  T %.2f S  N %d", mode_name(pr_spec_mode), pr_spec.peak_nm, pr_spec.inttime, pr_spec.nmeas);
+        pr_plot();
+        if (*pr_msg) text(6, 148, pr_msg, 1, RED);
     } else {
         int dp = pr_page - base;
         for (int i = 0; i < PR_PER_PAGE; i++) {
@@ -1489,12 +1530,12 @@ extern "C" void app_main() {
                     pr_spos = sp;
                     pr_but = bt;
                     if (press) {
-                        if (sp == munki::POS_CALIB) pr_measure();
-                        else pr_msg = "TURN DIAL TO CALIBRATION";
+                        pr_measure(sp);
                         changed = true;
-                    } else if (changed && sp != munki::POS_CALIB && *pr_msg) {
+                    } else if (changed && sp != pr_spos_prev && *pr_msg) {
                         pr_msg = "";
                     }
+                    pr_spos_prev = sp;
                     if (changed) pr_show();
                 }
             }
