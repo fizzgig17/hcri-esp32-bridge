@@ -1276,7 +1276,7 @@ static void pr_describe() {
     pr_n = 0;
     usb_device_info_t info;
     const usb_device_desc_t *dd = NULL;
-    if (usb_host_get_device_info(pr_dev, &info) != ESP_OK || usb_host_get_device_descriptor(pr_dev, &dd) != ESP_OK || !dd) {
+    if (usb_host_device_info(pr_dev, &info) != ESP_OK || usb_host_get_device_descriptor(pr_dev, &dd) != ESP_OK || !dd) {
         pr_add("COULD NOT READ THE DEVICE DESCRIPTOR");
         return;
     }
