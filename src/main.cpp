@@ -304,8 +304,9 @@ static void present() {
 
 #endif
 
-static bool ready_shown = false;  // the READY screen is what's on show (its arrow depends on the orientation)
-static void clear() { memset(fb, 0, W * H * 2); ready_shown = false; }
+static int shown = 0;      // which screen is on show: 1 READY, 2 result (both carry the button arrow); 0 any other
+static bool result_ok = true;  // the result screen's "ok", to redraw it after a flip
+static void clear() { memset(fb, 0, W * H * 2); shown = 0; }
 
 static inline void px(int x, int y, uint16_t c) {
     if (x >= 0 && x < W && y >= 0 && y < H) fb[y * W + x] = c;
@@ -529,7 +530,7 @@ static void draw_battery() {
 // Power-chip state line on the idle screens (NO USB / READY): input status, charge state, fault flags, battery mV.
 static bool diag_on = false;
 static void draw_diag() {
-    fill(0, 134, W, 20, BLACK);
+    fill(0, 134, W, 19, BLACK);   // stops above the flipped button arrow (y 153+)
     if (dbg_stat < 0) return;
     char d[40];
     snprintf(d, sizeof d, "S%d C%d F%02X %dmV", dbg_stat, dbg_chrg, dbg_fault, dbg_mv);
@@ -1020,9 +1021,25 @@ static void link_tick() {
 }
 
 // ----------------------------------------------------------------- UI ----
+// A small yellow arrow pointing at the scan button: the button is just beyond the top-right corner, or, with the screen
+// flipped, just beyond the bottom-left corner. Drawn on the READY and result screens.
+static void draw_btn_arrow() {
+    if (!flipped) {
+        const int cx = 312;
+        for (int i = 0; i <= 5; i++) fill(cx - i, 3 + i, 2 * i + 1, 1, YELLOW);   // head, tip at the top
+        fill(cx - 1, 9, 3, 8, YELLOW);                                              // shaft
+    } else {
+        const int cx = 8;
+        for (int i = 0; i <= 5; i++) fill(cx - i, 166 - i, 2 * i + 1, 1, YELLOW); // head, tip at the bottom
+        fill(cx - 1, 153, 3, 8, YELLOW);
+    }
+}
+
 static void header(const char *right, uint16_t rc) {
     text(6, 4, "TORCH BEARER", 2, WHITE);
-    text(W - 6 - (int)strlen(right) * 12, 4, right, 2, rc);
+    // On the arrow screens the upright arrow owns the top-right corner, so the right-hand status steps left of it.
+    int edge = (shown != 0 && !flipped) ? W - 24 : W - 6;
+    text(edge - (int)strlen(right) * 12, 4, right, 2, rc);
     draw_battery();
     for (int x = 0; x < W; x++) px(x, 22, GREY);
     draw_app_link();
@@ -1041,26 +1058,14 @@ static void ui_waiting() {
 
 static void ui_ready() {
     clear();
+    shown = 1;
     header("READY", GREEN);
     text(6, 32, device_id, 1, GREY);
     textf(6, 48, 1, GREY, "RANGE %d-%d NM", range_lo, range_hi);
-    ready_shown = true;
-    if (!flipped) {
-        text(20, 84, "PRESS BUTTON", 2, WHITE);
-        text(20, 104, "TO SCAN", 2, WHITE);
-        // Arrow up and to the right: the button is just above the top-right corner of the screen.
-        thick_line(196, 120, 280, 36, 4, YELLOW);
-        thick_line(280, 36, 262, 36, 4, YELLOW);
-        thick_line(280, 36, 280, 54, 4, YELLOW);
-    } else {
-        // Turned 180 degrees, the button is below the bottom-left corner: the text moves right and the arrow points down and to the left.
-        text(160, 84, "PRESS BUTTON", 2, WHITE);
-        text(160, 104, "TO SCAN", 2, WHITE);
-        thick_line(130, 62, 36, 140, 4, YELLOW);
-        thick_line(36, 140, 54, 140, 4, YELLOW);
-        thick_line(36, 140, 36, 122, 4, YELLOW);
-    }
-    textf(6, 160, 1, GREY, "FW %s", FW_VERSION);
+    text(20, 84, "PRESS BUTTON", 2, WHITE);
+    text(20, 104, "TO SCAN", 2, WHITE);
+    draw_btn_arrow();
+    textf(flipped ? 18 : 6, 160, 1, GREY, "FW %s", FW_VERSION);
     diag_on = true;
     draw_diag();
     present();
@@ -1089,6 +1094,8 @@ static void ui_result(bool ok) {
     Metrics m;
     bool have_m = compute_metrics(scan.spd, n, scan.start_nm, &m);
     clear();
+    shown = 2;
+    result_ok = ok;
     header(ok ? "DONE" : "NO LOCK", ok ? GREEN : RED);
 
     // colorimetry, computed on the board from the corrected spectrum
@@ -1119,7 +1126,8 @@ static void ui_result(bool ok) {
         int pkx = pk * (pw - 1) / (n - 1);
         vline(px0 + pkx, py0, py0 + ph, YELLOW);
     }
-    textf(px0, 162, 1, GREY, "%d", range_lo);
+    textf(flipped ? px0 + 8 : px0, 162, 1, GREY, "%d", range_lo);   // steps right of the flipped arrow
+    draw_btn_arrow();
     textf(px0 + pw / 2 - 9, 162, 1, GREY, "%d", (range_lo + range_hi) / 2);
     textf(px0 + pw - 24, 162, 1, GREY, "%d", range_hi);
     present();
@@ -1135,7 +1143,8 @@ static void flip_tick() {
     flipped = f;
     apply_flip(f);
     flip_save(f);
-    if (ready_shown) ui_ready();  // redraws and presents, with the arrow on the other side
+    if (shown == 1) ui_ready();            // redraw with the arrow in the other corner
+    else if (shown == 2) ui_result(result_ok);
     else present();
 }
 
