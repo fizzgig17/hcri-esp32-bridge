@@ -74,8 +74,9 @@ static const char *FW_VERSION = FW_STR(FW_GIT);
 #define PIN_SD_CS     14   // shares the SPI bus; keep it deselected
 #define PIN_I2C_SDA   5
 #define PIN_I2C_SCL   6
-#define PIN_BTN_A     0    // BOOT
-#define PIN_BTN_B     12   // user button 2
+#define PIN_BTN_A     12   // side button, top press: starts a scan
+#define PIN_BTN_B     16   // side button, bottom press: starts a scan
+#define PIN_BTN_BOOT  0    // BOOT: shown in the button readout, but does not start a scan
 #else
 #define PIN_POWER_ON 15
 #define PIN_LCD_BL   38
@@ -1054,11 +1055,11 @@ static void draw_btn_arrow() {
 
 // ------------------------------------------------------- button readout ----
 // Which button pins are held, shown on the idle and result screens and logged, to see what each physical button does.
-// The Pro also watches GPIO 16, which is not a scan button.
+// The Pro also watches BOOT (GPIO 0), which is not a scan button there.
 static const int WATCH_PINS[] = {
     PIN_BTN_A, PIN_BTN_B,
 #ifdef BOARD_PRO
-    16,
+    PIN_BTN_BOOT,
 #endif
 };
 static const int N_WATCH = (int)(sizeof(WATCH_PINS) / sizeof(WATCH_PINS[0]));
@@ -1228,7 +1229,7 @@ extern "C" void app_main() {
     bi.pull_up_en = GPIO_PULLUP_ENABLE;
     bi.pin_bit_mask = (1ULL << PIN_BTN_A) | (1ULL << PIN_BTN_B);
 #ifdef BOARD_PRO
-    bi.pin_bit_mask |= (1ULL << 16);   // watched for the on-screen button readout only
+    bi.pin_bit_mask |= (1ULL << PIN_BTN_BOOT);   // watched for the on-screen button readout only
 #endif
     gpio_config(&bi);
 
