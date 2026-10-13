@@ -44,6 +44,16 @@ static void set_err(const char *fmt, ...) {
     ESP_LOGW(TAGM, "%s", g_err);
 }
 
+    if (usb_host_transfer_submit_control(g_client, t) == ESP_OK) {
+        pump(w, timeout_ms);
+        ok = w.done && w.status == USB_TRANSFER_STATUS_COMPLETED;
+        if (ok && in) memcpy(buf, t->data_buffer + sizeof(usb_setup_packet_t), len);
+        if (!ok) set_err("REQ %02X ST %d", req, (int)w.status);
+    }
+    if (w.done || !ok) usb_host_transfer_free(t);
+    return ok;
+}
+
 // Vendor control transfer on endpoint 0 (the instrument uses these for almost everything).
 static bool ctrl(bool in, uint8_t req, uint8_t *buf, int len, int timeout_ms = 2000) {
     if (!g_dev) return false;
@@ -66,16 +76,6 @@ static bool ctrl(bool in, uint8_t req, uint8_t *buf, int len, int timeout_ms = 2
     t->context = &w;
     t->timeout_ms = timeout_ms;
     bool ok = false;
-    if (usb_host_transfer_submit_control(g_client, t) == ESP_OK) {
-        pump(w, timeout_ms);
-        ok = w.done && w.status == USB_TRANSFER_STATUS_COMPLETED;
-        if (ok && in) memcpy(buf, t->data_buffer + sizeof(usb_setup_packet_t), len);
-        if (!ok) set_err("REQ %02X ST %d", req, (int)w.status);
-    }
-    if (w.done || !ok) usb_host_transfer_free(t);
-    return ok;
-}
-
 // Bulk IN read (instrument data comes back on endpoint 0x81), handed to `sink` one transfer at a time so nothing larger
 // than a single 4 KB buffer is ever needed (the bridge runs Bluetooth too and has little free RAM for a 40 KB buffer).
 // Every transfer is a multiple of 64 bytes except possibly the last, so the stream stays aligned with the instrument.
