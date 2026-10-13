@@ -96,8 +96,8 @@ static const int PIN_LCD_D[8] = {39, 40, 41, 42, 45, 46, 47, 48};
 static uint16_t *fb;  // W*H RGB565, byte-swapped for the panel
 static esp_lcd_panel_handle_t panel;
 
-// Display orientation. The default has the text upright with the USB-C end on the right; "flipped" is that turned
-// 180 degrees. It is chosen from the app (BLE command 0x03) and kept in flash so it survives a power cycle.
+// Display orientation. The default is the same way up on both boards (buttons at the bottom-left of the picture);
+// "flipped" is that turned 180 degrees. It is chosen from the app (BLE command 0x03) and kept in flash so it survives a power cycle.
 static bool nvs_ready = false;
 static void nvs_boot() {
     if (nvs_ready) return;
@@ -236,8 +236,9 @@ static void present() {
     vTaskDelay(pdMS_TO_TICKS(40));  // let the DMA finish before fb is touched again
 }
 #else
-// Turned 180 degrees = both mirrors swapped.
-static void apply_flip(bool f) { esp_lcd_panel_mirror(panel, !f, f); }
+// The default here is the Pro's default turned 180 degrees (this board's old "flipped"), so both boards start the same
+// way up: buttons at the bottom-left of the picture. Flipping swaps both mirrors.
+static void apply_flip(bool f) { esp_lcd_panel_mirror(panel, f, !f); }
 
 static void lcd_init() {
     gpio_config_t o = {};
@@ -1021,17 +1022,10 @@ static void link_tick() {
 }
 
 // ----------------------------------------------------------------- UI ----
-// A small yellow arrow pointing at the scan button on the READY and result screens. The button sits at a different
-// corner on each board. T-Display S3: off the right edge near the top, so the arrow is top-right pointing right
-// (flipped: bottom-left pointing left). T-Display-S3 Pro: below the bottom-left corner, so the arrow is bottom-left
-// pointing down (flipped: top-right pointing up).
-static inline bool arrow_bottom_left() {
-#ifdef BOARD_PRO
-    return !flipped;
-#else
-    return flipped;
-#endif
-}
+// A small yellow arrow pointing at the scan button on the READY and result screens. Unflipped, the buttons are at the
+// bottom-left on both boards: S3 arrow bottom-left pointing left, Pro arrow bottom-left pointing down. Flipped, they are
+// at the top-right: S3 arrow pointing right, Pro arrow pointing up.
+static inline bool arrow_bottom_left() { return !flipped; }   // both boards now start with the buttons at the bottom-left
 
 static void draw_btn_arrow() {
 #ifdef BOARD_PRO
