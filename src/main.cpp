@@ -74,8 +74,9 @@ static const char *FW_VERSION = FW_STR(FW_GIT);
 #define PIN_SD_CS     14   // shares the SPI bus; keep it deselected
 #define PIN_I2C_SDA   5
 #define PIN_I2C_SCL   6
-#define PIN_BTN_A     0    // BOOT
-#define PIN_BTN_B     12   // user button 2
+#define PIN_BTN_A     12   // side button, top press: starts a scan
+#define PIN_BTN_B     16   // side button, bottom press: starts a scan
+#define PIN_BTN_BOOT  0    // BOOT: shown in the button readout, but does not start a scan
 #else
 #define PIN_POWER_ON 15
 #define PIN_LCD_BL   38
@@ -96,8 +97,8 @@ static const int PIN_LCD_D[8] = {39, 40, 41, 42, 45, 46, 47, 48};
 static uint16_t *fb;  // W*H RGB565, byte-swapped for the panel
 static esp_lcd_panel_handle_t panel;
 
-// Display orientation. The default has the text upright with the USB-C end on the right; "flipped" is that turned
-// 180 degrees. It is chosen from the app (BLE command 0x03) and kept in flash so it survives a power cycle.
+// Display orientation. The default is the same way up on both boards (buttons at the bottom-left of the picture);
+// "flipped" is that turned 180 degrees. It is chosen from the app (BLE command 0x03) and kept in flash so it survives a power cycle.
 static bool nvs_ready = false;
 static void nvs_boot() {
     if (nvs_ready) return;
@@ -236,8 +237,9 @@ static void present() {
     vTaskDelay(pdMS_TO_TICKS(40));  // let the DMA finish before fb is touched again
 }
 #else
-// Turned 180 degrees = both mirrors swapped.
-static void apply_flip(bool f) { esp_lcd_panel_mirror(panel, !f, f); }
+// The default here is the Pro's default turned 180 degrees (this board's old "flipped"), so both boards start the same
+// way up: buttons at the bottom-left of the picture. Flipping swaps both mirrors.
+static void apply_flip(bool f) { esp_lcd_panel_mirror(panel, f, !f); }
 
 static void lcd_init() {
     gpio_config_t o = {};
@@ -306,7 +308,8 @@ static void present() {
 
 static int shown = 0;      // which screen is on show: 1 READY, 2 result (both carry the button arrow); 0 any other
 static bool result_ok = true;  // the result screen's "ok", to redraw it after a flip
-static void clear() { memset(fb, 0, W * H * 2); shown = 0; }
+static bool waiting_shown = false;  // the NO USB screen is on show
+static void clear() { memset(fb, 0, W * H * 2); shown = 0; waiting_shown = false; }
 
 static inline void px(int x, int y, uint16_t c) {
     if (x >= 0 && x < W && y >= 0 && y < H) fb[y * W + x] = c;
@@ -1021,17 +1024,10 @@ static void link_tick() {
 }
 
 // ----------------------------------------------------------------- UI ----
-// A small yellow arrow pointing at the scan button on the READY and result screens. The button sits at a different
-// corner on each board. T-Display S3: off the right edge near the top, so the arrow is top-right pointing right
-// (flipped: bottom-left pointing left). T-Display-S3 Pro: below the bottom-left corner, so the arrow is bottom-left
-// pointing down (flipped: top-right pointing up).
-static inline bool arrow_bottom_left() {
-#ifdef BOARD_PRO
-    return !flipped;
-#else
-    return flipped;
-#endif
-}
+// A small yellow arrow pointing at the scan button on the READY and result screens. Unflipped, the buttons are at the
+// bottom-left on both boards: S3 arrow bottom-left pointing left, Pro arrow bottom-left pointing down. Flipped, they are
+// at the top-right: S3 arrow pointing right, Pro arrow pointing up.
+static inline bool arrow_bottom_left() { return !flipped; }   // both boards now start with the buttons at the bottom-left
 
 static void draw_btn_arrow() {
 #ifdef BOARD_PRO
@@ -1057,6 +1053,41 @@ static void draw_btn_arrow() {
 #endif
 }
 
+// ------------------------------------------------------- button readout ----
+// Which button pins are held, shown on the idle and result screens and logged, to see what each physical button does.
+// The Pro also watches BOOT (GPIO 0), which is not a scan button there.
+static const int WATCH_PINS[] = {
+    PIN_BTN_A, PIN_BTN_B,
+#ifdef BOARD_PRO
+    PIN_BTN_BOOT,
+#endif
+};
+static const int N_WATCH = (int)(sizeof(WATCH_PINS) / sizeof(WATCH_PINS[0]));
+static char btn_text[40] = "";
+static uint32_t btn_seen = 0;
+
+static uint32_t button_mask() {
+    uint32_t m = 0;
+    for (int i = 0; i < N_WATCH; i++)
+        if (gpio_get_level((gpio_num_t)WATCH_PINS[i]) == 0) m |= 1u << i;
+    return m;
+}
+static void btn_note(uint32_t m) {
+    if (!m) return;
+    int n = snprintf(btn_text, sizeof btn_text, "BTN GPIO");
+    bool first = true;
+    for (int i = 0; i < N_WATCH && n < (int)sizeof btn_text - 6; i++) {
+        if (!(m & (1u << i))) continue;
+        n += snprintf(btn_text + n, sizeof btn_text - n, first ? "%d" : "+%d", WATCH_PINS[i]);
+        first = false;
+    }
+    ESP_LOGI(TAG, "button pressed: %s", btn_text);
+}
+static void draw_btn_note() {
+    fill(20, 122, 200, 9, BLACK);
+    if (btn_text[0]) text(20, 122, btn_text, 1, CYAN);
+}
+
 static void header(const char *right, uint16_t rc) {
     text(6, 4, "TORCH BEARER", 2, WHITE);
     // On the arrow screens the upright arrow owns the top-right corner, so the right-hand status steps left of it.
@@ -1072,6 +1103,8 @@ static void ui_waiting() {
     header("NO USB", RED);
     text(20, 70, "PLUG IN SPECTROMETER", 2, YELLOW);
     text(20, 100, "VIA OTG CABLE", 2, GREY);
+    waiting_shown = true;
+    draw_btn_note();
     textf(6, 160, 1, GREY, "FW %s", FW_VERSION);
     diag_on = true;
     draw_diag();
@@ -1086,6 +1119,7 @@ static void ui_ready() {
     textf(6, 48, 1, GREY, "RANGE %d-%d NM", range_lo, range_hi);
     text(20, 84, "PRESS BUTTON", 2, WHITE);
     text(20, 104, "TO SCAN", 2, WHITE);
+    draw_btn_note();
     draw_btn_arrow();
     textf(arrow_bottom_left() ? 18 : 6, 160, 1, GREY, "FW %s", FW_VERSION);
     diag_on = true;
@@ -1150,6 +1184,7 @@ static void ui_result(bool ok) {
     }
     textf(arrow_bottom_left() ? px0 + 8 : px0, 162, 1, GREY, "%d", range_lo);   // steps right of the flipped arrow
     draw_btn_arrow();
+    if (btn_text[0]) text(196, 80, btn_text, 1, CYAN);
     textf(px0 + pw / 2 - 9, 162, 1, GREY, "%d", (range_lo + range_hi) / 2);
     textf(px0 + pw - 24, 162, 1, GREY, "%d", range_hi);
     present();
@@ -1170,6 +1205,19 @@ static void flip_tick() {
     else present();
 }
 
+// Idle loops: when a watched pin goes low, log it and show it on the idle screens.
+static void btn_tick() {
+    uint32_t m = button_mask();
+    if (m == btn_seen) return;
+    btn_seen = m;
+    if (!m) return;
+    btn_note(m);
+    if (shown == 1 || waiting_shown) {
+        draw_btn_note();
+        present();
+    }
+}
+
 static bool button_pressed() {
     return gpio_get_level((gpio_num_t)PIN_BTN_A) == 0 || gpio_get_level((gpio_num_t)PIN_BTN_B) == 0;
 }
@@ -1180,6 +1228,9 @@ extern "C" void app_main() {
     bi.mode = GPIO_MODE_INPUT;
     bi.pull_up_en = GPIO_PULLUP_ENABLE;
     bi.pin_bit_mask = (1ULL << PIN_BTN_A) | (1ULL << PIN_BTN_B);
+#ifdef BOARD_PRO
+    bi.pin_bit_mask |= (1ULL << PIN_BTN_BOOT);   // watched for the on-screen button readout only
+#endif
     gpio_config(&bi);
 
     ESP_LOGI(TAG, "firmware commit %s", FW_VERSION);
@@ -1199,6 +1250,7 @@ extern "C" void app_main() {
                 vcp.reset();
                 if (ble_scan_req) { ble_scan_req = false; ble_status(3, 0, 0); }
                 flip_tick();
+                btn_tick();
                 battery_tick();
                 link_tick();
                 vTaskDelay(pdMS_TO_TICKS(500));
@@ -1215,6 +1267,7 @@ extern "C" void app_main() {
             } else if (button_pressed()) {
                 vTaskDelay(pdMS_TO_TICKS(30));  // debounce
                 trigger = from_button = button_pressed();
+                if (trigger) { btn_seen = button_mask(); btn_note(btn_seen); }
             }
             if (ble_resend_req) {
                 ble_resend_req = false;
@@ -1234,6 +1287,7 @@ extern "C" void app_main() {
                 // result stays on screen; the next press or BLE command starts a new scan
             }
             flip_tick();
+            btn_tick();
             battery_tick();
             link_tick();
             vTaskDelay(pdMS_TO_TICKS(20));
