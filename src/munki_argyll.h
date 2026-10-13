@@ -41,6 +41,29 @@ struct Eeprom {
 bool read_calibration(Eeprom *e);
 const uint8_t *calibration_data();   // the block read above (nullptr until read), length = Eeprom::size rounded up to 4
 
+// Measurement settings the instrument stores in its calibration block (offsets as in Argyll's EEPROM parser).
+struct Params {
+    double min_sval, opt_sval, max_sval, sat_limit;   // sensor target values and saturation limit (raw counts)
+    double cal_int_time;     // integration time to use for calibration (seconds)
+    double preheat_s;        // LED pre-heat time (seconds)
+    double wait_s;           // LED wait time (seconds)
+    double invalid_s;        // reflectance readings to discard while the LED settles (seconds)
+    int hold_temp_duty;      // LED hold-temperature duty cycle
+    double tick_s;           // length of one integration clock tick (seconds)
+};
+bool get_params(Params *p);   // needs read_calibration() and get_firmware() first
+
+// One averaged raw reading: 128 sensor bands plus the 4 shielded (dark) cells and the LED temperature value.
+struct Raw {
+    float band[128];
+    double shielded;         // mean of the 4 shielded cells
+    double mean, max;        // over the 128 bands
+    double led;              // LED temperature value (raw)
+    int n;                   // readings averaged
+};
+// Triggers a measurement (lamp on or off), discards `ninvalid` leading readings and averages the next `nmeas`.
+bool measure_raw(bool lamp, double inttime_s, int ninvalid, int nmeas, Raw *out);
+
 const char *pos_name(uint8_t spos);
 
 }  // namespace munki

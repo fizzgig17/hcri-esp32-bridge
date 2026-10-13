@@ -117,6 +117,8 @@ void close() {
     g_dev = NULL;
 }
 
+static int g_tick_us = 0;
+
 bool get_firmware(Firmware *f) {
     uint8_t p[24];
     if (!ctrl(true, 0x86, p, 24)) return false;
@@ -124,6 +126,7 @@ bool get_firmware(Firmware *f) {
     f->fw_minor = buf2int(&p[4]);
     f->tick_dur = buf2int(&p[8]);
     f->min_int_count = buf2int(&p[12]);
+    g_tick_us = f->tick_dur;
     f->ee_blocks = buf2int(&p[16]);
     f->ee_block_size = buf2int(&p[20]);
     return true;
@@ -186,6 +189,78 @@ bool read_calibration(Eeprom *e) {
     e->compat_version = (int)(b[2] | (b[3] << 8));
     g_cal = b;   // kept (with the checksum word zeroed, as Argyll does) for the parser
     return true;
+}
+
+static int u16at(const uint8_t *b, int off) { return b[off] | (b[off + 1] << 8); }
+static double f32at(const uint8_t *b, int off) {
+    uint32_t v = (uint32_t)buf2int(b + off);
+    float f;
+    memcpy(&f, &v, 4);
+    return (double)f;
+}
+
+// Offsets from Argyll munki_parse_eeprom(): u16 at 5400..5406, float at 5408, int32 at 5412/5416, u16 at 5420/5422.
+bool get_params(Params *p) {
+    if (!g_cal || g_tick_us <= 0) return false;
+    p->min_sval = u16at(g_cal, 5400);
+    p->opt_sval = u16at(g_cal, 5402);
+    p->max_sval = u16at(g_cal, 5404);
+    p->sat_limit = u16at(g_cal, 5406);
+    p->cal_int_time = f32at(g_cal, 5408) * 1e-3;
+    p->preheat_s = buf2int(g_cal + 5412) * 1e-3;
+    p->wait_s = buf2int(g_cal + 5416) * 1e-3;
+    p->hold_temp_duty = u16at(g_cal, 5420);
+    p->invalid_s = u16at(g_cal, 5422) * 1e-3;
+    p->tick_s = g_tick_us * 1e-6;
+    return true;
+}
+
+// Argyll munki_triggermeasure() + munki_readmeasurement() + the raw-sample layout from munki_sens_to_raw():
+// each reading is 137 little-endian 16 bit values: 6 leading (the first 4 are shielded cells), 128 bands, 3 trailing
+// (the last is the LED temperature value).
+static const int NSEN = 137, NRAW = 128, RDBYTES = 274;
+
+bool measure_raw(bool lamp, double inttime_s, int ninvalid, int nmeas, Raw *out) {
+    Params pr;
+    if (!get_params(&pr) || nmeas < 1 || ninvalid < 0) return false;
+    int total = ninvalid + nmeas;
+    int intclocks = (int)(inttime_s / pr.tick_s + 0.5);
+    uint8_t cmd[12] = {};
+    cmd[0] = lamp ? 1 : 0;   // lamp
+    cmd[1] = 0;              // scan: off (spot reading)
+    cmd[2] = 0;              // gain: normal
+    cmd[3] = (uint8_t)pr.hold_temp_duty;
+    int2buf(&cmd[4], intclocks);
+    int2buf(&cmd[8], total);
+    if (!ctrl(false, 0x80, cmd, 12)) return false;
+    size_t bytes = (size_t)RDBYTES * total;
+    uint8_t *buf = (uint8_t *)malloc(bytes);
+    if (!buf) return false;
+    int timeout = 2000 + (int)(inttime_s * total * 1000.0);
+    bool ok = bulk_in(buf, (int)bytes, timeout);
+    if (ok) {
+        memset(out, 0, sizeof *out);
+        double acc[NRAW] = {};
+        for (int i = ninvalid; i < total; i++) {
+            const uint8_t *r = buf + (size_t)i * RDBYTES;
+            for (int k = 0; k < 4; k++) out->shielded += u16at(r, k * 2);
+            for (int j = 0; j < NRAW; j++) acc[j] += u16at(r, (6 + j) * 2);
+            out->led += u16at(r, (NSEN - 1) * 2);
+        }
+        out->n = nmeas;
+        out->shielded /= 4.0 * nmeas;
+        out->led /= nmeas;
+        double sum = 0, mx = 0;
+        for (int j = 0; j < NRAW; j++) {
+            out->band[j] = (float)(acc[j] / nmeas);
+            sum += out->band[j];
+            if (out->band[j] > mx) mx = out->band[j];
+        }
+        out->mean = sum / NRAW;
+        out->max = mx;
+    }
+    free(buf);
+    return ok;
 }
 
 const char *pos_name(uint8_t s) {

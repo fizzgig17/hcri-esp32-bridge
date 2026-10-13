@@ -1319,6 +1319,10 @@ static void pr_describe() {
 static bool pr_munki = false;
 static uint8_t pr_spos = 0xFF, pr_but = 0;
 static munki::Eeprom pr_ee;
+static munki::Raw pr_dark, pr_white;
+static bool pr_have_dark = false, pr_have_white = false;
+static const char *pr_msg = "";
+static double pr_sat = 0;
 static int pr_ee_state = 0;   // 0 not read, 1 checksum OK, 2 checksum BAD, 3 read failed
 static void pr_query() {
     pr_munki = false;
@@ -1348,6 +1352,29 @@ static void pr_query() {
     if (munki::get_chip_id(id)) pr_add("CHIP %02X-%02X%02X%02X%02X%02X%02X%02X", id[0], id[1], id[2], id[3], id[4], id[5], id[6], id[7]);
 }
 
+// Dial on CALIBRATION + instrument button: a dark reading (lamp off), then a white-tile reading (lamp on, after the
+// LED settling readings the instrument asks for). Shows raw counts only; turning them into a spectrum is stage 4.
+static void pr_show();
+static void pr_measure() {
+    munki::Params p;
+    if (!munki::get_params(&p)) { pr_msg = "NO CALIBRATION DATA"; return; }
+    pr_sat = p.sat_limit;
+    pr_have_dark = pr_have_white = false;
+    pr_msg = "MEASURING DARK...";
+    pr_show();
+    double it = p.cal_int_time;
+    if (!munki::measure_raw(false, it, 0, 4, &pr_dark)) { pr_msg = "DARK READING FAILED"; return; }
+    pr_have_dark = true;
+    pr_msg = "MEASURING WHITE...";
+    pr_show();
+    int ninv = (int)(p.invalid_s / it) + 1;
+    if (!munki::measure_raw(true, it, ninv, 4, &pr_white)) { pr_msg = "WHITE READING FAILED"; return; }
+    pr_have_white = true;
+    pr_msg = pr_white.max >= p.sat_limit ? "WHITE IS SATURATED" : "";
+    ESP_LOGI(TAG, "dark: shielded %.1f mean %.1f max %.1f | white: shielded %.1f mean %.1f max %.1f led %.0f | int %.4f s ninv %d sat %.0f",
+             pr_dark.shielded, pr_dark.mean, pr_dark.max, pr_white.shielded, pr_white.mean, pr_white.max, pr_white.led, it, ninv, p.sat_limit);
+}
+
 static void pr_frame(const char *right, uint16_t rc) {
     clear();
     text(6, 4, "COLORMUNKI PROBE", 2, WHITE);
@@ -1375,12 +1402,13 @@ static void pr_show() {
     if (pr_page >= pages) pr_page = 0;
     if (pr_munki && pr_page == 0) {
         text(6, 28, "DIAL", 1, GREY);
-        text(6, 40, pr_spos == 0xFF ? "-" : munki::pos_name(pr_spos), 4, YELLOW);
-        text(6, 80, "BUTTON", 1, GREY);
-        text(6, 92, pr_but ? "PRESSED" : "-", 3, pr_but ? GREEN : YELLOW);
-        text(6, 124, "EEPROM", 1, GREY);
-        const char *es = pr_ee_state == 1 ? "CHECKSUM OK" : pr_ee_state == 2 ? "CHECKSUM BAD" : pr_ee_state == 3 ? "READ FAILED" : "-";
-        text(6, 136, es, 2, pr_ee_state == 1 ? GREEN : pr_ee_state == 0 ? GREY : RED);
+        text(6, 38, pr_spos == 0xFF ? "-" : munki::pos_name(pr_spos), 4, YELLOW);
+        textf(6, 74, 2, pr_but ? GREEN : YELLOW, "BUTTON %s", pr_but ? "PRESSED" : "-");
+        if (pr_have_dark) textf(6, 94, 2, WHITE, "DARK  AVG %.0f MAX %.0f", pr_dark.mean, pr_dark.max);
+        if (pr_have_white) textf(6, 112, 2, WHITE, "WHITE AVG %.0f MAX %.0f", pr_white.mean, pr_white.max);
+        if (*pr_msg) text(6, 134, pr_msg, 1, RED);
+        else textf(6, 134, 1, GREY, "EEPROM %s  DIAL TO CAL + MUNKI BUTTON = MEASURE",
+                   pr_ee_state == 1 ? "OK" : pr_ee_state == 2 ? "BAD" : pr_ee_state == 3 ? "FAIL" : "-");
     } else {
         int dp = pr_page - base;
         for (int i = 0; i < PR_PER_PAGE; i++) {
@@ -1449,13 +1477,26 @@ extern "C" void app_main() {
                 while (button_pressed()) vTaskDelay(pdMS_TO_TICKS(20));
             }
         }
-        if (pr_munki && pr_dev) {   // live dial position and instrument button
+        if (pr_munki && pr_dev) {   // live dial position and instrument button; button press on CALIBRATION measures
             static uint32_t last = 0;
             uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
-            if (now - last >= 300) {
+            if (now - last >= 100) {
                 last = now;
                 uint8_t sp, bt;
-                if (munki::get_status(&sp, &bt) && (sp != pr_spos || bt != pr_but)) { pr_spos = sp; pr_but = bt; pr_show(); }
+                if (munki::get_status(&sp, &bt)) {
+                    bool press = bt && !pr_but;
+                    bool changed = (sp != pr_spos || bt != pr_but);
+                    pr_spos = sp;
+                    pr_but = bt;
+                    if (press) {
+                        if (sp == munki::POS_CALIB) pr_measure();
+                        else pr_msg = "TURN DIAL TO CALIBRATION";
+                        changed = true;
+                    } else if (changed && sp != munki::POS_CALIB && *pr_msg) {
+                        pr_msg = "";
+                    }
+                    if (changed) pr_show();
+                }
             }
         }
         battery_tick();
