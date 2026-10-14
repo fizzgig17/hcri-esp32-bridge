@@ -830,7 +830,7 @@ static void ble_status(uint8_t state, uint8_t tries, float exp_ms) {
     last_state[1] = tries;
     memcpy(last_state + 2, &exp_ms, 4);
     last_state[6] = meter_kind;
-    last_state[7] = meter_flags;
+    last_state[7] = meter_flags | ((TB_APPLY_CORRECTION && meter_kind == 0) ? 0x40 : 0);   // bit6: spectrum already corrected on board
     {
         uint16_t a = meter_cal_age_min ? meter_cal_age_min() : 0xFFFF;
         last_state[8] = (uint8_t)(a & 0xFF);
@@ -841,7 +841,7 @@ static void ble_status(uint8_t state, uint8_t tries, float exp_ms) {
 // Re-send the current status with the latest meter flags (the dial moved, or calibration finished).
 static void ble_status_refresh() {
     last_state[6] = meter_kind;
-    last_state[7] = meter_flags;
+    last_state[7] = meter_flags | ((TB_APPLY_CORRECTION && meter_kind == 0) ? 0x40 : 0);   // bit6: spectrum already corrected on board
     {
         uint16_t a = meter_cal_age_min ? meter_cal_age_min() : 0xFFFF;
         last_state[8] = (uint8_t)(a & 0xFF);
