@@ -800,6 +800,7 @@ static bool have_result = false;
 static uint8_t last_state[10] = {3, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF};
 static uint16_t (*meter_cal_age_min)() = NULL;   // ColorMunki: minutes since dark calibration (0xFFFF = none)
 static uint8_t meter_kind = 0, meter_flags = 0;
+static bool hdr_generic = false;   // no instrument plugged in yet: the header must not claim a Torch Bearer
 
 struct Stats { int pk; float mx, sum; };
 static Stats stats_of(const Scan &s) {
@@ -901,7 +902,7 @@ static int ble_gap_cb(struct ble_gap_event *ev, void *);
 static void ble_advertise() {
     struct ble_hs_adv_fields f = {};
     f.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
-    f.name = (uint8_t *)"Torch Bearer";
+    f.name = (uint8_t *)"hCRI Bridge";
     f.name_len = 12;
     f.name_is_complete = 1;
     ble_gap_adv_set_fields(&f);
@@ -1016,7 +1017,7 @@ static void ble_start() {
 
     ESP_ERROR_CHECK(ble_gatts_count_cfg(ble_svcs));
     ESP_ERROR_CHECK(ble_gatts_add_svcs(ble_svcs));
-    ble_svc_gap_device_name_set("Torch Bearer");
+    ble_svc_gap_device_name_set("hCRI Bridge");
     ble_att_set_preferred_mtu(247);
     nimble_port_freertos_init(ble_host_task);
 }
@@ -1116,7 +1117,7 @@ static void draw_btn_note() {
 }
 
 static void header(const char *right, uint16_t rc) {
-    text(6, 4, meter_kind == 1 ? "COLORMUNKI" : "TORCH BEARER", 2, WHITE);
+    text(6, 4, meter_kind == 1 ? "COLORMUNKI" : hdr_generic ? "HCRI BRIDGE" : "TORCH BEARER", 2, WHITE);
     // On the arrow screens the upright arrow owns the top-right corner, so the right-hand status steps left of it.
     int edge = (shown != 0 && !arrow_bottom_left()) ? W - 24 : W - 6;
     text(edge - (int)strlen(right) * 12, 4, right, 2, rc);
@@ -1127,7 +1128,9 @@ static void header(const char *right, uint16_t rc) {
 
 static void ui_waiting() {
     clear();
+    hdr_generic = true;
     header("NO USB", RED);
+    hdr_generic = false;
     text(20, 70, "PLUG IN SPECTROMETER", 2, YELLOW);
     text(20, 100, "VIA OTG CABLE", 2, GREY);
     waiting_shown = true;

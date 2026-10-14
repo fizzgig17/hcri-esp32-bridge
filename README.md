@@ -38,7 +38,7 @@ For use with the hCRI Companion app (Android and iPhone):
    download `hcri-esp32-bridge-factory.bin` (T-Display S3) from the same release.
 2. Put the board in download mode and flash that file at **0x0** (steps below -- Chrome or Edge is enough).
 3. Plug the spectrometer into the board with the OTG cable, power it from the power bank, and open
-   the hCRI Companion app: the bridge appears as **Torch Bearer**.
+   the hCRI Companion app: the bridge appears as **hCRI Bridge** (older firmware: Torch Bearer). Once connected, the app shows the instrument that is plugged in, Torch Bearer or ColorMunki.
 
 The board allows one Bluetooth connection at a time and stops advertising while connected, so close
 other Bluetooth tools (for example nRF Connect) if the app can't see it.
@@ -85,7 +85,7 @@ downloads the right firmware (checksum-verified) and flashes it.
      (use your own port; on Linux/macOS it looks like `/dev/ttyACM0`). Add
      `erase_flash` as a separate first command only if the board misbehaves after a flash.
 3. Unplug the board and power it from a power bank via the OTG cable (spectrometer in the female
-   USB-A), or tap **RST**. The screen should show the idle Torch Bearer screen.
+   USB-A), or tap **RST**. The screen shows HCRI BRIDGE / NO USB until an instrument is plugged in, then TORCH BEARER or COLORMUNKI.
 
 ## Building it yourself (VS Code + PlatformIO extension)
 1. File > Open Folder... > this folder (a path **without spaces**). First build downloads the
@@ -97,7 +97,7 @@ downloads the right firmware (checksum-verified) and flashes it.
 4. Unplug. Power from a power bank into the OTG cable's female USB-C, spectrometer in the female USB-A.
 
 ## Bluetooth (BLE) trigger
-Advertises as "Torch Bearer". Service 7a1c0001-5b2e-4f0a-9c3d-2e8f6b4a1d00:
+Advertises as "hCRI Bridge" (firmware before October 14, 2026 advertised "Torch Bearer"; the app accepts both). Service 7a1c0001-5b2e-4f0a-9c3d-2e8f6b4a1d00:
 - 7a1c0002-... command (write): 01 = scan now, 02 = resend last result
 - 7a1c0003-... result (notify/read): summary packet, then the full spectrum in chunks
 - 7a1c0004-... status (notify/read): [state u8][try u8][exposure_ms f32]; state 0 ready, 1 scanning, 2 done, 3 error, 4 done-not-locked
