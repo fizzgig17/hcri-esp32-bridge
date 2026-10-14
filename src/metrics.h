@@ -18,9 +18,10 @@ struct Metrics {
 };
 
 // ---- correction -----------------------------------------------------------
-// 0 = show/send the raw spectrum (default while the curve is still being validated); 1 = apply the fitted curve.
+// 0 = show/send the raw spectrum; 1 = apply the fitted curve (default: the app no longer applies it for this firmware,
+// the status flag bit 6 tells it so).
 #ifndef TB_APPLY_CORRECTION
-#define TB_APPLY_CORRECTION 0
+#define TB_APPLY_CORRECTION 1
 #endif
 // Multiplies a raw spectrum (1 nm steps from start_nm) by the HPCS-fitted curve.
 static inline void apply_correction(float *spd, int npts, int start_nm) {
