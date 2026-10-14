@@ -1173,6 +1173,8 @@ static void ui_progress(int tries, float exp_ms, int status) {
 
 static void ui_scanning() { ui_progress(0, 0, 2); }
 
+static uint16_t wl_color(int nm);
+
 static void ui_result(bool ok) {
     diag_on = false;
     int n = scan.npts;
@@ -1209,7 +1211,8 @@ static void ui_result(bool ok) {
             int i = x * (n - 1) / (pw - 1);
             int h = (int)(scan.spd[i] / mx * (ph - 1));
             if (h < 0) h = 0;
-            vline(px0 + x, py0 + ph - h, py0 + ph - 1, ok ? GREEN : RED);
+            vline(px0 + x, py0 + ph - h, py0 + ph - 1,
+                  wl_color(range_lo + x * (range_hi - range_lo) / (pw - 1)));   // each column in its own wavelength colour
         }
         int pkx = pk * (pw - 1) / (n - 1);
         vline(px0 + pkx, py0, py0 + ph, YELLOW);
@@ -1418,6 +1421,7 @@ static void pr_measure(uint8_t pos) {
 }
 
 static uint16_t wl_color(int nm) {   // rough wavelength to colour
+    if (nm < 380 || nm > 750) return rgb(80, 80, 80);   // UV / IR: no visible colour, plot in grey
     double r = 0, g = 0, b = 0;
     if (nm < 440) { r = (440 - nm) / 60.0; b = 1; }
     else if (nm < 490) { g = (nm - 440) / 50.0; b = 1; }
