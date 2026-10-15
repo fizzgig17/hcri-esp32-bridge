@@ -201,6 +201,15 @@ int main() {
     CHECK(g_queued.empty(), "nothing left queued after the cancel");
     r = read(400000, &s);
     CHECK(r == munki::MR_OK, "next reading after a failure works (%s)", munki::result_name(r));
+    // Cancel: stops at the next step, leaves nothing queued, and the next reading still works.
+    static int calls = 0;
+    munki::set_cancel_check([]() { return ++calls > 1; });   // let the first trial run, then cancel
+    r = read(9000, &s);
+    CHECK(r == munki::MR_CANCELLED, "cancel stops the reading (%s)", munki::result_name(r));
+    CHECK(g_queued.empty() && g_stream.empty(), "nothing left queued or unread after a cancel");
+    munki::set_cancel_check(nullptr);
+    r = read(400000, &s);
+    CHECK(r == munki::MR_OK, "reading after a cancel works (%s)", munki::result_name(r));
     printf("\nlive transfers left: %zu\n", g_live.size());
     printf(fails ? "\n%d FAILED\n" : "\nALL PASSED\n", fails);
     return fails ? 1 : 0;

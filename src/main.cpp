@@ -773,7 +773,8 @@ static bool tb_scan(progress_fn progress, int timeout_s) {
 
 // ------------------------------------------------------------- BLE ----
 // GATT service 7a1c0001-5b2e-4f0a-9c3d-2e8f6b4a1d00 ("Torch Bearer"):
-//   0002 command  (write)  : 01 = scan now, 02 = resend last result
+//   0002 command  (write)  : 01 = scan now, 02 = resend last result, 05 = cancel the reading in progress (ColorMunki:
+//                            stops at its next step and goes back to ready without sending a result)
 //   0003 result   (notify/read): summary packet, then the full spectrum in chunks
 //   0004 status   (notify/read): [state u8][try u8][exposure_ms f32]
 //        state: 0 ready, 1 scanning, 2 done, 3 error (no USB / timeout), 4 done but not locked
@@ -797,6 +798,11 @@ static bool res_sub = false, sta_sub = false;
 static uint8_t own_addr_type;
 static volatile bool ble_scan_req = false;
 static volatile bool ble_resend_req = false;
+// Cancel (command 05) applies to a reading only if it arrived after that reading was requested, so a late cancel
+// can never swallow the next reading.
+static volatile int64_t ble_scan_req_us = 0, ble_cancel_us = 0;
+static int64_t scan_started_us = 0;
+static bool scan_cancelled() { return ble_cancel_us > scan_started_us; }
 static bool have_result = false;
 // State 3 = no spectrometer: that is what a phone must read when it connects before one is plugged in (it becomes 0 'ready' once USB connects).
 // Bytes 6 and 7 are new: [6] meter kind (0 Torch Bearer, 1 ColorMunki), [7] ColorMunki flags: bit7 dial known, bits0-1 dial position
@@ -979,7 +985,8 @@ static int ble_access_cb(uint16_t, uint16_t, struct ble_gatt_access_ctxt *ctxt, 
     if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR && which == 0) {
         uint8_t cmd = 0;
         if (OS_MBUF_PKTLEN(ctxt->om) >= 1 && os_mbuf_copydata(ctxt->om, 0, 1, &cmd) == 0) {
-            if (cmd == 0x01) ble_scan_req = true;
+            if (cmd == 0x01) { ble_scan_req_us = esp_timer_get_time(); ble_scan_req = true; }
+            if (cmd == 0x05) ble_cancel_us = esp_timer_get_time();   // cancel the reading in progress (ColorMunki)
             if (cmd == 0x02) ble_resend_req = true;
             if (cmd == 0x03) {  // 0x03 <0|1>: display orientation, 1 = turned 180 degrees
                 uint8_t v = 0;
@@ -1778,12 +1785,14 @@ static void mk_fail(uint8_t reason, const char *msg) {
 
 static void mk_do(uint8_t dial) {
     mk_msg = "";
+    if (scan_cancelled()) { ble_status(0, 0, 0); ui_munki_ready(); return; }   // cancelled before it started
     if (dial == munki::POS_CALIB) {
         ble_status(1, 0, 0);
         ui_munki_busy("CALIBRATING...");
         bool ok = munki::dark_calibrate();
         mk_dial = dial;
         meter_flags = mk_flags_now();
+        if (!ok && scan_cancelled()) { mk_msg = "CANCELLED"; ble_status(0, 0, 0); ui_munki_ready(); return; }
         if (!ok) { mk_fail(MKR_CAL_FAILED, munki::last_error()); return; }
         ble_status(0, 0, 0);
         ui_munki_ready();
@@ -1793,7 +1802,11 @@ static void mk_do(uint8_t dial) {
         ui_munki_busy("MEASURING...");
         munki::Spectrum s;
         munki::Result r = munki::measure_spectrum(munki::MODE_AMBIENT, &s);
-        if (r == munki::MR_OK || r == munki::MR_LOW_LIGHT) {
+        if (r == munki::MR_CANCELLED) {
+            mk_msg = "CANCELLED";
+            ble_status(0, 0, 0);
+            ui_munki_ready();
+        } else if (r == munki::MR_OK || r == munki::MR_LOW_LIGHT) {
             mk_fill_scan(s, r == munki::MR_LOW_LIGHT);
             have_result = true;
             ui_result(true);
@@ -1811,6 +1824,7 @@ static void mk_do(uint8_t dial) {
 
 // Runs while a ColorMunki is attached; returns when it is unplugged.
 static void mk_session() {
+    munki::set_cancel_check(scan_cancelled);
     meter_kind = 1;
     meter_cal_age_min = mk_age_min;
     strncpy(device_id, "COLORMUNKI", sizeof device_id);
@@ -1847,6 +1861,8 @@ static void mk_session() {
         bt_prev = bt;
         if (ble_resend_req) { ble_resend_req = false; ble_send_result(); }
         if (trigger) {
+            // A reading started from the phone counts from its request; one started with a button counts from now.
+            scan_started_us = ble_scan_req ? ble_scan_req_us : esp_timer_get_time();
             ble_scan_req = false;
             mk_do(mk_dial);
             meter_flags = mk_flags_now();

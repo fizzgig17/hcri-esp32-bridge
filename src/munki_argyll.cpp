@@ -455,6 +455,10 @@ struct DarkRef {
 static DarkRef g_dark[2] = {};          // [0] normal gain, [1] high gain
 static double g_highgain = 0;           // gain ratio of high gain mode (Argyll: 1 / lin1[1]); 0 = unusable
 
+static bool (*g_cancel)() = nullptr;
+void set_cancel_check(bool (*fn)()) { g_cancel = fn; }
+static bool cancelled() { return g_cancel && g_cancel(); }
+
 static void forget_instrument() {
     g_fw_valid = false;
     g_dark[0].valid = g_dark[1].valid = false;
@@ -485,9 +489,11 @@ static bool dark_pair(const Params &pr, int gain, DarkRef *d) {
     int n0 = (int)(READ_TIME / tmin + 0.5);
     if (n0 < 1) n0 = 1;
     if (n0 > 140) n0 = 140;
+    if (cancelled()) { set_err("CANCELLED"); return false; }
     if (!measure_raw(false, gain, tmin, 0, n0, &r)) return false;
     d->t0 = r.inttime;
     put_dark(d->d0, r);
+    if (cancelled()) { set_err("CANCELLED"); return false; }
     if (!measure_raw(false, gain, DARK_T1, 0, 1, &r)) return false;
     d->t1 = r.inttime;
     put_dark(d->d1, r);
@@ -506,6 +512,7 @@ bool dark_calibrate() {
     double l1 = f32at(g_cal, 4952 + (3 - 1) * 4);
     g_highgain = (l1 > 0 && l1 == l1) ? 1.0 / l1 : 0;
     if (g_highgain > 1.0 && g_highgain < 100.0) {
+        if (cancelled()) return true;   // normal-gain references are done; high gain just stays off
         if (!dark_pair(pr, 1, &g_dark[1])) ESP_LOGW(TAGM, "high gain dark reference failed; high gain stays off");
     } else {
         ESP_LOGW(TAGM, "high gain ratio %.3f looks wrong; high gain stays off", g_highgain);
@@ -614,6 +621,7 @@ Result measure_spectrum(Mode mode, Spectrum *out) {
     double signal = 0, fill = 1.0;
     Raw r;
     for (int it = 0; it < 5; it++) {
+        if (cancelled()) return MR_CANCELLED;
         if (T < tmin) T = tmin;
         if (!measure_raw(false, gain, T, 0, 1, &r)) return MR_COMMS;
         T = r.inttime;
@@ -646,6 +654,7 @@ Result measure_spectrum(Mode mode, Spectrum *out) {
     int n = (int)((dim ? LOW_READ_TIME : READ_TIME) / T + 0.5);
     if (n < 1) n = 1;
     if (n > 40) n = 40;
+    if (cancelled()) return MR_CANCELLED;
     if (!measure_raw(false, gain, T, 0, n, &r)) return MR_COMMS;
     if (r.max > pr.sat_limit) return MR_TOO_BRIGHT;
     memset(out, 0, sizeof *out);
@@ -672,6 +681,7 @@ const char *result_name(Result r) {
         case MR_TOO_BRIGHT: return "TOO BRIGHT";
         case MR_LOW_LIGHT: return "LOW LIGHT";
         case MR_NO_PROJ: return "NO PROJECTOR DATA";
+        case MR_CANCELLED: return "CANCELLED";
     }
     return "?";
 }

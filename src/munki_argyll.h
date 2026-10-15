@@ -71,7 +71,10 @@ bool measure_raw(bool lamp, int gain, double inttime_s, int ninvalid, int nmeas,
 
 // ---- Emission / ambient spectrum (Argyll's adaptive emissive spot measurement, standard resolution) ----
 enum Mode { MODE_AMBIENT, MODE_EMISSION, MODE_PROJECTOR };   // dial: ambient / surface / projector
-enum Result { MR_OK = 0, MR_NO_DARK, MR_NO_DATA, MR_COMMS, MR_TOO_BRIGHT, MR_LOW_LIGHT, MR_NO_PROJ };
+enum Result { MR_OK = 0, MR_NO_DARK, MR_NO_DATA, MR_COMMS, MR_TOO_BRIGHT, MR_LOW_LIGHT, MR_NO_PROJ, MR_CANCELLED };
+// Checked between the steps of a reading or a dark calibration; returning true stops it (MR_CANCELLED / false).
+// A step already sent to the instrument always finishes first, so the USB stream stays in step.
+void set_cancel_check(bool (*fn)());
 struct Spectrum {
     float v[36];             // 380..730 nm in 10 nm steps, in Argyll's units for the mode
     double inttime;          // integration time used (seconds)
