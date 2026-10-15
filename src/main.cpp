@@ -800,7 +800,8 @@ static volatile bool ble_resend_req = false;
 static bool have_result = false;
 // State 3 = no spectrometer: that is what a phone must read when it connects before one is plugged in (it becomes 0 'ready' once USB connects).
 // Bytes 6 and 7 are new: [6] meter kind (0 Torch Bearer, 1 ColorMunki), [7] ColorMunki flags: bit7 dial known, bits0-1 dial position
-// (0 projector, 1 surface, 2 calibration, 3 ambient), bit2 dark calibration done. Older apps read only the first 6 bytes.
+// (0 projector, 1 surface, 2 calibration, 3 ambient), bit2 dark calibration done, bit3 high-gain dark references taken.
+// Older apps read only the first 6 bytes.
 static uint8_t last_state[10] = {3, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF};
 static uint16_t (*meter_cal_age_min)() = NULL;   // ColorMunki: minutes since dark calibration (0xFFFF = none)
 static uint8_t meter_kind = 0, meter_flags = 0;
@@ -1650,7 +1651,8 @@ static uint16_t mk_age_min() {
 }
 
 static uint8_t mk_flags_now() {
-    return (uint8_t)((mk_dial <= 3 ? (0x80 | mk_dial) : 0) | (munki::dark_valid() ? 0x04 : 0));
+    return (uint8_t)((mk_dial <= 3 ? (0x80 | mk_dial) : 0) | (munki::dark_valid() ? 0x04 : 0) |
+                     (munki::high_gain_ready() ? 0x08 : 0));   // bit3: high-gain dark references taken
 }
 
 // Looks at newly attached devices; returns true once a ColorMunki is open and its calibration data is read.
