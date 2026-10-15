@@ -70,6 +70,8 @@ downloads the right firmware (checksum-verified) and flashes it.
   `--s3` or `--s3pro` say which board it is (no test program, no menu), and `--yes` answers every question with its
   default, so `py hcri_companion_esp32_bridge.py --s3 --prod --yes` flashes with no prompts. The board still has to be in
   download mode if the bridge firmware is running on it.
+- **Already up to date?** Before flashing it reads which build is on the board (commit and build time) and compares it
+  with the download. If they are the same build it does nothing (it asks first, unless `--yes`). `--force` flashes anyway.
 
 ## Flashing a downloaded build
 

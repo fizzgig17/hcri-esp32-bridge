@@ -10,6 +10,10 @@ hCRI Companion ESP32 Bridge -- find the ESP32 on USB, show what it is, download 
     python hcri_companion_esp32_bridge.py --s3pro    the board is a T-Display-S3 Pro: same (--pro also works)
     python hcri_companion_esp32_bridge.py --yes      answer every question with its default, so it just flashes
     python hcri_companion_esp32_bridge.py --munki    flash the ColorMunki identify tool (T-Display-S3 Pro only)
+    python hcri_companion_esp32_bridge.py --force    flash even if the board already has exactly this build
+
+Before flashing it reads which build is on the board (a 256-byte read, about a second) and skips the flash when it is
+already the one downloaded. --force flashes anyway.
 
 Hands-off examples:  py hcri_companion_esp32_bridge.py --s3 --prod --yes
                      py hcri_companion_esp32_bridge.py --s3pro --dev --yes
@@ -26,6 +30,7 @@ plain board lacks) and remembers each board by its MAC address.
 import hashlib
 import json
 import os
+import struct
 import subprocess
 import sys
 import tempfile
@@ -83,6 +88,7 @@ def save_state(st):
 
 
 AUTO_YES = "--yes" in sys.argv or "-y" in sys.argv
+FORCE = "--force" in sys.argv
 FORCED_KIND = "s3" if "--s3" in sys.argv else ("pro" if ("--s3pro" in sys.argv or "--pro" in sys.argv) else None)
 
 
@@ -120,6 +126,51 @@ def run_esptool(args, capture=False):
         r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
         return r.returncode, r.stdout
     return subprocess.call(cmd), ""
+
+
+def app_desc(data):
+    """Parses an ESP-IDF app description (esp_app_desc_t), which sits 0x20 bytes into an app image: version (the
+    firmware stamps its git commit there), build date/time and the SHA-256 of the app's ELF, which is unique per build.
+    Returns None if the bytes are not one (e.g. an erased board)."""
+    d = data[0x20:0x20 + 256]
+    if len(d) < 176 or struct.unpack_from("<I", d, 0)[0] != 0xABCD5432:
+        return None
+    text = lambda a, b: d[a:b].split(b"\0")[0].decode("ascii", "replace")
+    return {"version": text(16, 48), "project": text(48, 80), "time": text(80, 96), "date": text(96, 112),
+            "elf_sha256": d[144:176].hex()}
+
+
+def image_app(path):
+    """(app partition offset, app description) of a full flash image written at 0x0, or (None, None)."""
+    with open(path, "rb") as f:
+        b = f.read()
+    for i in range(0x8000, 0x8000 + 0xC00, 32):          # partition table: 32-byte entries, magic AA 50
+        e = b[i:i + 32]
+        if e[:2] != b"\xaa\x50":
+            break
+        if e[2] == 0:                                     # first app partition
+            off = struct.unpack_from("<I", e, 4)[0]
+            return off, app_desc(b[off:off + 0x200])
+    return None, None
+
+
+def board_app(port, off):
+    """App description of what is on the board now, read from its flash at `off` (None if it can't be read)."""
+    dest = os.path.join(tempfile.gettempdir(), "hcri-bridge-installed.bin")
+    try:
+        os.remove(dest)
+    except OSError:
+        pass
+    rc, _ = run_esptool(["--chip", "esp32s3", "--port", port, "--baud", "460800",
+                         "read_flash", hex(off), "0x200", dest], capture=True)
+    if rc != 0 or not os.path.exists(dest):
+        return None
+    with open(dest, "rb") as f:
+        return app_desc(f.read())
+
+
+def describe(a):
+    return "%s (built %s %s)" % (a["version"], a["date"], a["time"]) if a else "unknown"
 
 
 def probe(port):
@@ -416,6 +467,22 @@ def main():
     if not path:
         print("That firmware isn't available. Nothing was changed.")
         return 1
+
+    # Is this exact build already on the board? Compare the ELF fingerprint of the downloaded image with the board's.
+    off, new = image_app(path)
+    if new and off is not None:
+        print("\nChecking which build is on the board...")
+        cur = board_app(port, off)
+        print("  On the board:  %s" % describe(cur))
+        print("  Downloaded:    %s" % describe(new))
+        if cur and cur["elf_sha256"] == new["elf_sha256"]:
+            if FORCE:
+                print("The board already has this build; --force: flashing it again anyway.")
+            else:
+                print("The board already has exactly this build.")
+                if not ask("Flash it again anyway? [y/N] ", "n").lower().startswith("y"):
+                    print("Nothing was changed. (Use --force to flash it anyway.)")
+                    return 0
 
     print("\nAbout to flash")
     print("  What:    %s" % text)
