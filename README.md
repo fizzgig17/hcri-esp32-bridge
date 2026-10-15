@@ -143,7 +143,10 @@ Test with nRF Connect: connect, subscribe to result + status, write 01 to the co
   once fitted; until then it is all 1.0 and `MK_CORR_FITTED` is 0. To fit it, measure several lamps with both the
   ColorMunki and the HPCS in the app, share each reading as CSV from History, and run
   `tools/fit_munki_corr.py --pair munki.csv hpcs.csv --pair ... --write`. It prints the CCT/Duv error before and
-  after, and a leave-one-out check with three or more lamps.
+  after, and a leave-one-out check with three or more lamps. The HPCS is blurred to the ColorMunki's ~10 nm
+  bandwidth before fitting (`--bandwidth`), so the curve corrects its colour response and not the resolution it
+  cannot recover. First fit (Oct 15 2026, 6 flashlights 2680-6880 K through a parchment diffuser): leave-one-out RMS
+  error against the HPCS 40 K -> 20 K CCT, 0.0014 -> 0.0010 Duv.
 - **Raw data for high resolution:** after each reading the bridge also sends the 128 linearised sensor values (and
   once per connection the calibration block). The app writes them to its log; `tools/munki_diag.py` extracts them.
   They are the inputs for porting Argyll's 3.3 nm mode and checking it against real readings.
