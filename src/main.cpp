@@ -782,12 +782,16 @@ static bool tb_scan(progress_fn progress, int timeout_s) {
 //   header   : 02 | npts u16 | start_nm u16 | step_nm u8 | total_bytes u16     (then float32 values)
 //   data     : 03 | seq u8 | bytes...                                          (seq counts from 0)
 //   end      : 04 | chunks u8
+//   diag     : 05 | id u8 | seq u8 | last u8 | bytes...   (ColorMunki diagnostics, sent after the end marker; apps that
+//              don't know 05 ignore it. id 1 = the reading's raw sensor data, id 2 = the instrument's calibration
+//              block, once per connection. Used to develop the high-resolution mode offline; see tools/munki_diag.py.)
 static const ble_uuid128_t SVC_UUID = BLE_UUID128_INIT(0x00,0x1d,0x4a,0x6b,0x8f,0x2e,0x3d,0x9c,0x0a,0x4f,0x2e,0x5b,0x01,0x00,0x1c,0x7a);
 static const ble_uuid128_t CMD_UUID = BLE_UUID128_INIT(0x00,0x1d,0x4a,0x6b,0x8f,0x2e,0x3d,0x9c,0x0a,0x4f,0x2e,0x5b,0x02,0x00,0x1c,0x7a);
 static const ble_uuid128_t RES_UUID = BLE_UUID128_INIT(0x00,0x1d,0x4a,0x6b,0x8f,0x2e,0x3d,0x9c,0x0a,0x4f,0x2e,0x5b,0x03,0x00,0x1c,0x7a);
 static const ble_uuid128_t STA_UUID = BLE_UUID128_INIT(0x00,0x1d,0x4a,0x6b,0x8f,0x2e,0x3d,0x9c,0x0a,0x4f,0x2e,0x5b,0x04,0x00,0x1c,0x7a);
 
 static uint16_t ble_conn = BLE_HS_CONN_HANDLE_NONE;
+static volatile uint32_t ble_conn_count = 0;   // counts connections, so "once per connection" survives reused handles
 static uint16_t res_handle, sta_handle;
 static bool res_sub = false, sta_sub = false;
 static uint8_t own_addr_type;
@@ -898,6 +902,26 @@ static void ble_send_result() {
     ble_notify(res_handle, res_sub, e, 2);
 }
 
+// A diagnostics blob as 05 packets (see the protocol comment above).
+static void ble_send_blob(uint8_t id, const uint8_t *d, size_t n) {
+    if (ble_conn == BLE_HS_CONN_HANDLE_NONE || !d || !n) return;
+    uint16_t mtu = ble_att_mtu(ble_conn);
+    size_t chunk = mtu > 23 ? mtu - 3 : 20;
+    if (chunk > 240) chunk = 240;
+    size_t payload = chunk - 4;
+    uint8_t pkt[256], seq = 0;
+    for (size_t off = 0; off < n; off += payload, seq++) {
+        size_t m = n - off < payload ? n - off : payload;
+        pkt[0] = 0x05;
+        pkt[1] = id;
+        pkt[2] = seq;
+        pkt[3] = off + m >= n ? 1 : 0;
+        memcpy(pkt + 4, d + off, m);
+        if (!ble_notify(res_handle, res_sub, pkt, m + 4)) break;
+        vTaskDelay(pdMS_TO_TICKS(6));
+    }
+}
+
 static int ble_gap_cb(struct ble_gap_event *ev, void *);
 static void ble_advertise() {
     struct ble_hs_adv_fields f = {};
@@ -925,6 +949,7 @@ static int ble_gap_cb(struct ble_gap_event *ev, void *) {
     case BLE_GAP_EVENT_CONNECT:
         if (ev->connect.status == 0) {
             ble_conn = ev->connect.conn_handle;
+            ble_conn_count++;
             ESP_LOGI(TAG, "BLE connected");
         } else {
             ble_advertise();
@@ -1662,6 +1687,7 @@ static bool mk_try_open() {
 // 36 bands at 10 nm -> 351 points at 1 nm (Catmull-Rom, clamped at zero), the grid the rest of the bridge and the app use.
 // The ColorMunki code yields mW/m^2/nm; the app (like the Torch Bearer path) expects W/m^2/nm, hence MK_UNITS.
 static const float MK_UNITS = 0.001f;
+#include "munki_corr.h"
 static void mk_fill_scan(const munki::Spectrum &s, bool low_light) {
     scan.start_nm = 380;
     scan.npts = 351;
@@ -1675,6 +1701,36 @@ static void mk_fill_scan(const munki::Spectrum &s, bool low_light) {
         float v = 0.5f * ((2 * p1) + (-p0 + p2) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t * t + (-p0 + 3 * p1 - 3 * p2 + p3) * t * t * t);
         scan.spd[i] = (v < 0 ? 0 : v) * MK_UNITS;
     }
+#if MK_CORR_FITTED
+    // HPCS-fitted shape correction (src/munki_corr.h). The app never applies its own curve to ColorMunki readings.
+    for (int i = 0; i < 351; i++) {
+        int k = 380 + i - MK_CORR_FIRST_NM;
+        scan.spd[i] *= MK_CORR[k < 0 ? 0 : k >= MK_CORR_N ? MK_CORR_N - 1 : k];
+    }
+#endif
+}
+
+// Raw data behind a reading, for developing the high-resolution mode offline (tools/munki_diag.py decodes it).
+// id 1, version 1: u8 version | u8 gain | u16 readings averaged | f32 integration time (s) | f32 absraw[128]
+// (dark-subtracted, linearised sensor values per second) | f32 band[36] (380-730 nm, before the unit change).
+// The calibration block (id 2) goes once per connection, before the first reading's data.
+static uint32_t mk_cal_sent_for = 0;
+static void mk_send_diag(const munki::Spectrum &s) {
+    if (ble_conn == BLE_HS_CONN_HANDLE_NONE) return;
+    if (mk_cal_sent_for != ble_conn_count) {
+        ble_send_blob(2, munki::calibration_data(), (size_t)munki::calibration_size());
+        mk_cal_sent_for = ble_conn_count;
+    }
+    static uint8_t b[8 + 128 * 4 + 36 * 4];
+    b[0] = 1;
+    b[1] = (uint8_t)s.gain;
+    uint16_t n = (uint16_t)s.nmeas;
+    float t = (float)s.inttime;
+    memcpy(b + 2, &n, 2);
+    memcpy(b + 4, &t, 4);
+    memcpy(b + 8, munki::last_absraw(), 128 * 4);
+    memcpy(b + 8 + 128 * 4, s.v, 36 * 4);
+    ble_send_blob(1, b, sizeof b);
 }
 
 static const char *mk_dial_name(uint8_t d) {
@@ -1741,6 +1797,7 @@ static void mk_do(uint8_t dial) {
             ui_result(true);
             ble_status(2, 0, scan.exposure_ms);
             ble_send_result();
+            mk_send_diag(s);
         } else if (r == munki::MR_TOO_BRIGHT) mk_fail(MKR_TOO_BRIGHT, "TOO BRIGHT");
         else if (r == munki::MR_NO_DARK) mk_fail(MKR_NO_DARK, "CALIBRATE FIRST (DIAL TO CALIBRATION)");
         else if (r == munki::MR_COMMS) mk_fail(MKR_COMMS, munki::last_error());
