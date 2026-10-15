@@ -773,7 +773,8 @@ static bool tb_scan(progress_fn progress, int timeout_s) {
 
 // ------------------------------------------------------------- BLE ----
 // GATT service 7a1c0001-5b2e-4f0a-9c3d-2e8f6b4a1d00 ("Torch Bearer"):
-//   0002 command  (write)  : 01 = scan now, 02 = resend last result
+//   0002 command  (write)  : 01 = scan now, 02 = resend last result, 05 = cancel the reading in progress (ColorMunki:
+//                            stops at its next step and goes back to ready without sending a result)
 //   0003 result   (notify/read): summary packet, then the full spectrum in chunks
 //   0004 status   (notify/read): [state u8][try u8][exposure_ms f32]
 //        state: 0 ready, 1 scanning, 2 done, 3 error (no USB / timeout), 4 done but not locked
@@ -782,21 +783,32 @@ static bool tb_scan(progress_fn progress, int timeout_s) {
 //   header   : 02 | npts u16 | start_nm u16 | step_nm u8 | total_bytes u16     (then float32 values)
 //   data     : 03 | seq u8 | bytes...                                          (seq counts from 0)
 //   end      : 04 | chunks u8
+//   diag     : 05 | id u8 | seq u8 | last u8 | bytes...   (ColorMunki diagnostics, sent after the end marker; apps that
+//              don't know 05 ignore it. id 1 = the reading's raw sensor data, id 2 = the instrument's calibration
+//              block, once per connection. Used to develop the high-resolution mode offline; see tools/munki_diag.py.)
 static const ble_uuid128_t SVC_UUID = BLE_UUID128_INIT(0x00,0x1d,0x4a,0x6b,0x8f,0x2e,0x3d,0x9c,0x0a,0x4f,0x2e,0x5b,0x01,0x00,0x1c,0x7a);
 static const ble_uuid128_t CMD_UUID = BLE_UUID128_INIT(0x00,0x1d,0x4a,0x6b,0x8f,0x2e,0x3d,0x9c,0x0a,0x4f,0x2e,0x5b,0x02,0x00,0x1c,0x7a);
 static const ble_uuid128_t RES_UUID = BLE_UUID128_INIT(0x00,0x1d,0x4a,0x6b,0x8f,0x2e,0x3d,0x9c,0x0a,0x4f,0x2e,0x5b,0x03,0x00,0x1c,0x7a);
 static const ble_uuid128_t STA_UUID = BLE_UUID128_INIT(0x00,0x1d,0x4a,0x6b,0x8f,0x2e,0x3d,0x9c,0x0a,0x4f,0x2e,0x5b,0x04,0x00,0x1c,0x7a);
 
 static uint16_t ble_conn = BLE_HS_CONN_HANDLE_NONE;
+static volatile uint32_t ble_conn_count = 0;   // counts connections, so "once per connection" survives reused handles
 static uint16_t res_handle, sta_handle;
 static bool res_sub = false, sta_sub = false;
 static uint8_t own_addr_type;
 static volatile bool ble_scan_req = false;
 static volatile bool ble_resend_req = false;
+// Cancel (command 05) applies to a reading only if it arrived after that reading was requested, so a late cancel
+// can never swallow the next reading.
+static volatile int64_t ble_scan_req_us = 0, ble_cancel_us = 0;
+static int64_t scan_started_us = 0;
+static bool scan_cancelled() { return ble_cancel_us > scan_started_us; }
 static bool have_result = false;
 // State 3 = no spectrometer: that is what a phone must read when it connects before one is plugged in (it becomes 0 'ready' once USB connects).
 // Bytes 6 and 7 are new: [6] meter kind (0 Torch Bearer, 1 ColorMunki), [7] ColorMunki flags: bit7 dial known, bits0-1 dial position
-// (0 projector, 1 surface, 2 calibration, 3 ambient), bit2 dark calibration done. Older apps read only the first 6 bytes.
+// (0 projector, 1 surface, 2 calibration, 3 ambient), bit2 dark calibration done, bit3 high-gain dark references taken,
+// bit6 the spectrum is already corrected on the board (Torch Bearer: corr_table.h; ColorMunki: munki_corr.h).
+// Older apps read only the first 6 bytes.
 static uint8_t last_state[10] = {3, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF};
 static uint16_t (*meter_cal_age_min)() = NULL;   // ColorMunki: minutes since dark calibration (0xFFFF = none)
 static uint8_t meter_kind = 0, meter_flags = 0;
@@ -898,6 +910,26 @@ static void ble_send_result() {
     ble_notify(res_handle, res_sub, e, 2);
 }
 
+// A diagnostics blob as 05 packets (see the protocol comment above).
+static void ble_send_blob(uint8_t id, const uint8_t *d, size_t n) {
+    if (ble_conn == BLE_HS_CONN_HANDLE_NONE || !d || !n) return;
+    uint16_t mtu = ble_att_mtu(ble_conn);
+    size_t chunk = mtu > 23 ? mtu - 3 : 20;
+    if (chunk > 240) chunk = 240;
+    size_t payload = chunk - 4;
+    uint8_t pkt[256], seq = 0;
+    for (size_t off = 0; off < n; off += payload, seq++) {
+        size_t m = n - off < payload ? n - off : payload;
+        pkt[0] = 0x05;
+        pkt[1] = id;
+        pkt[2] = seq;
+        pkt[3] = off + m >= n ? 1 : 0;
+        memcpy(pkt + 4, d + off, m);
+        if (!ble_notify(res_handle, res_sub, pkt, m + 4)) break;
+        vTaskDelay(pdMS_TO_TICKS(6));
+    }
+}
+
 static int ble_gap_cb(struct ble_gap_event *ev, void *);
 static void ble_advertise() {
     struct ble_hs_adv_fields f = {};
@@ -925,6 +957,7 @@ static int ble_gap_cb(struct ble_gap_event *ev, void *) {
     case BLE_GAP_EVENT_CONNECT:
         if (ev->connect.status == 0) {
             ble_conn = ev->connect.conn_handle;
+            ble_conn_count++;
             ESP_LOGI(TAG, "BLE connected");
         } else {
             ble_advertise();
@@ -953,7 +986,8 @@ static int ble_access_cb(uint16_t, uint16_t, struct ble_gatt_access_ctxt *ctxt, 
     if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR && which == 0) {
         uint8_t cmd = 0;
         if (OS_MBUF_PKTLEN(ctxt->om) >= 1 && os_mbuf_copydata(ctxt->om, 0, 1, &cmd) == 0) {
-            if (cmd == 0x01) ble_scan_req = true;
+            if (cmd == 0x01) { ble_scan_req_us = esp_timer_get_time(); ble_scan_req = true; }
+            if (cmd == 0x05) ble_cancel_us = esp_timer_get_time();   // cancel the reading in progress (ColorMunki)
             if (cmd == 0x02) ble_resend_req = true;
             if (cmd == 0x03) {  // 0x03 <0|1>: display orientation, 1 = turned 180 degrees
                 uint8_t v = 0;
@@ -1586,6 +1620,7 @@ extern "C" void app_main() {
 // scan = a reading, sent as a 1 nm spectrum interpolated from the instrument's 36 bands (380-730 nm, 10 nm).
 #include "usb/usb_helpers.h"
 #include "munki_argyll.h"
+#include "munki_corr.h"   // MK_CORR_FITTED is needed by mk_flags_now() below
 
 static usb_host_client_handle_t mk_client = NULL;
 static usb_device_handle_t mk_dev = NULL;
@@ -1625,7 +1660,9 @@ static uint16_t mk_age_min() {
 }
 
 static uint8_t mk_flags_now() {
-    return (uint8_t)((mk_dial <= 3 ? (0x80 | mk_dial) : 0) | (munki::dark_valid() ? 0x04 : 0));
+    return (uint8_t)((mk_dial <= 3 ? (0x80 | mk_dial) : 0) | (munki::dark_valid() ? 0x04 : 0) |
+                     (munki::high_gain_ready() ? 0x08 : 0) |   // bit3: high-gain dark references taken
+                     (MK_CORR_FITTED ? 0x40 : 0));             // bit6: spectrum corrected on board (src/munki_corr.h)
 }
 
 // Looks at newly attached devices; returns true once a ColorMunki is open and its calibration data is read.
@@ -1675,6 +1712,36 @@ static void mk_fill_scan(const munki::Spectrum &s, bool low_light) {
         float v = 0.5f * ((2 * p1) + (-p0 + p2) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t * t + (-p0 + 3 * p1 - 3 * p2 + p3) * t * t * t);
         scan.spd[i] = (v < 0 ? 0 : v) * MK_UNITS;
     }
+#if MK_CORR_FITTED
+    // HPCS-fitted shape correction (src/munki_corr.h). The app never applies its own curve to ColorMunki readings.
+    for (int i = 0; i < 351; i++) {
+        int k = 380 + i - MK_CORR_FIRST_NM;
+        scan.spd[i] *= MK_CORR[k < 0 ? 0 : k >= MK_CORR_N ? MK_CORR_N - 1 : k];
+    }
+#endif
+}
+
+// Raw data behind a reading, for developing the high-resolution mode offline (tools/munki_diag.py decodes it).
+// id 1, version 1: u8 version | u8 gain | u16 readings averaged | f32 integration time (s) | f32 absraw[128]
+// (dark-subtracted, linearised sensor values per second) | f32 band[36] (380-730 nm, before the unit change).
+// The calibration block (id 2) goes once per connection, before the first reading's data.
+static uint32_t mk_cal_sent_for = 0;
+static void mk_send_diag(const munki::Spectrum &s) {
+    if (ble_conn == BLE_HS_CONN_HANDLE_NONE) return;
+    if (mk_cal_sent_for != ble_conn_count) {
+        ble_send_blob(2, munki::calibration_data(), (size_t)munki::calibration_size());
+        mk_cal_sent_for = ble_conn_count;
+    }
+    static uint8_t b[8 + 128 * 4 + 36 * 4];
+    b[0] = 1;
+    b[1] = (uint8_t)s.gain;
+    uint16_t n = (uint16_t)s.nmeas;
+    float t = (float)s.inttime;
+    memcpy(b + 2, &n, 2);
+    memcpy(b + 4, &t, 4);
+    memcpy(b + 8, munki::last_absraw(), 128 * 4);
+    memcpy(b + 8 + 128 * 4, s.v, 36 * 4);
+    ble_send_blob(1, b, sizeof b);
 }
 
 static const char *mk_dial_name(uint8_t d) {
@@ -1720,12 +1787,14 @@ static void mk_fail(uint8_t reason, const char *msg) {
 
 static void mk_do(uint8_t dial) {
     mk_msg = "";
+    if (scan_cancelled()) { ble_status(0, 0, 0); ui_munki_ready(); return; }   // cancelled before it started
     if (dial == munki::POS_CALIB) {
         ble_status(1, 0, 0);
         ui_munki_busy("CALIBRATING...");
         bool ok = munki::dark_calibrate();
         mk_dial = dial;
         meter_flags = mk_flags_now();
+        if (!ok && scan_cancelled()) { mk_msg = "CANCELLED"; ble_status(0, 0, 0); ui_munki_ready(); return; }
         if (!ok) { mk_fail(MKR_CAL_FAILED, munki::last_error()); return; }
         ble_status(0, 0, 0);
         ui_munki_ready();
@@ -1735,12 +1804,17 @@ static void mk_do(uint8_t dial) {
         ui_munki_busy("MEASURING...");
         munki::Spectrum s;
         munki::Result r = munki::measure_spectrum(munki::MODE_AMBIENT, &s);
-        if (r == munki::MR_OK || r == munki::MR_LOW_LIGHT) {
+        if (r == munki::MR_CANCELLED) {
+            mk_msg = "CANCELLED";
+            ble_status(0, 0, 0);
+            ui_munki_ready();
+        } else if (r == munki::MR_OK || r == munki::MR_LOW_LIGHT) {
             mk_fill_scan(s, r == munki::MR_LOW_LIGHT);
             have_result = true;
             ui_result(true);
             ble_status(2, 0, scan.exposure_ms);
             ble_send_result();
+            mk_send_diag(s);
         } else if (r == munki::MR_TOO_BRIGHT) mk_fail(MKR_TOO_BRIGHT, "TOO BRIGHT");
         else if (r == munki::MR_NO_DARK) mk_fail(MKR_NO_DARK, "CALIBRATE FIRST (DIAL TO CALIBRATION)");
         else if (r == munki::MR_COMMS) mk_fail(MKR_COMMS, munki::last_error());
@@ -1752,6 +1826,7 @@ static void mk_do(uint8_t dial) {
 
 // Runs while a ColorMunki is attached; returns when it is unplugged.
 static void mk_session() {
+    munki::set_cancel_check(scan_cancelled);
     meter_kind = 1;
     meter_cal_age_min = mk_age_min;
     strncpy(device_id, "COLORMUNKI", sizeof device_id);
@@ -1788,6 +1863,8 @@ static void mk_session() {
         bt_prev = bt;
         if (ble_resend_req) { ble_resend_req = false; ble_send_result(); }
         if (trigger) {
+            // A reading started from the phone counts from its request; one started with a button counts from now.
+            scan_started_us = ble_scan_req ? ble_scan_req_us : esp_timer_get_time();
             ble_scan_req = false;
             mk_do(mk_dial);
             meter_flags = mk_flags_now();

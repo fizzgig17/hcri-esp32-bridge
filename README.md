@@ -70,6 +70,8 @@ downloads the right firmware (checksum-verified) and flashes it.
   `--s3` or `--s3pro` say which board it is (no test program, no menu), and `--yes` answers every question with its
   default, so `py hcri_companion_esp32_bridge.py --s3 --prod --yes` flashes with no prompts. The board still has to be in
   download mode if the bridge firmware is running on it.
+- **Already up to date?** Before flashing it reads which build is on the board (commit and build time) and compares it
+  with the download. If they are the same build it does nothing (it asks first, unless `--yes`). `--force` flashes anyway.
 
 ## Flashing a downloaded build
 
@@ -107,21 +109,47 @@ Result packets (little-endian):
 - 02 | npts u16 | start_nm u16 | step_nm u8 | total_bytes u16   (header; float32 spectrum values follow)
 - 03 | seq u8 | bytes...   (data chunks, seq from 0)
 - 04 | chunks u8           (end marker)
+- 05 | id u8 | seq u8 | last u8 | bytes...   (ColorMunki diagnostics after the end marker: id 1 = the reading's raw
+  sensor data, id 2 = the calibration block once per connection. Apps that don't know 05 ignore it.)
 
 Test with nRF Connect: connect, subscribe to result + status, write 01 to the command characteristic.
 
 ## Spectral correction and on-board colorimetry
 
 - `src/corr_table.h` holds a per-nm multiplier (340-1000 nm) fitted against an HPCS-330P on white
-  lamps. **The board sends the raw spectrum** (`TB_APPLY_CORRECTION` is 0 in `src/metrics.h`) and
-  the hCRI Companion app applies the same curve, on by default, with a Settings toggle ("Torch Bearer
-  correction"). Keep the firmware flag at 0 -- if you set it to 1 you must switch the app toggle off,
-  or the curve is applied twice. On 5 lamps not used in the fit (1727-4362 K) it cut the CCT RMS
-  error against the HPCS from 208 K to 36 K. Shape only: lux/PAR stay uncalibrated.
+  lamps. **The board applies it** (`TB_APPLY_CORRECTION` is 1 in `src/metrics.h`) and says so in status byte 7
+  bit 6, so the hCRI Companion app does not apply its own copy (it still does for older firmware). On 5 lamps not
+  used in the fit (1727-4362 K) it cut the CCT RMS error against the HPCS from 208 K to 36 K. Shape only: lux/PAR
+  stay uncalibrated.
 - `src/metrics.h` computes x, y, CCT, Duv, Ra and R9 on the board (a port of the app's
   `analyzeSpectrum`). Rf/Rg and lux are not computed here. Results matched the app on 8 test
   spectra: x/y/Duv/Ra/R9 identical, CCT within 0.3 K (`tools/host_test.cpp` rebuilds that check on a PC).
 - `tools/gen_tables.py` regenerates `src/metrics_tables.h` and `src/corr_table.h`.
+
+## ColorMunki measurements
+
+- **Integration time and gain** follow ArgyllCMS (`munki_optimise_sensor`): about 90 % of the sensor's optimum
+  level, at most 2 s per integration unless the light is very dim, then up to 4.5 s. Only when even 4.5 s is not
+  enough does it switch to the sensor's high-gain mode (`MUNKI_HIGH_GAIN` in `src/munki_argyll.cpp`; set it to 0
+  to never use it, as stock Argyll does). The dark calibration takes the extra high-gain references for this.
+- **Averaging:** normally 1 s worth of integrations per reading (Argyll); in dim light (2 s or more per
+  integration) 8 s worth instead, so a dim reading is several integrations, not one.
+- **Integration times** are whole instrument clock ticks, and that exact time is used for the dark reference and
+  the per-second scaling. Saturation is checked on every single integration, not only their average.
+- `tools/munki_sim_test.cpp` runs the driver against a simulated instrument on a PC (bright, dim, very dim,
+  saturated, and a USB read that never completes):
+  `g++ -std=gnu++17 -I tools/sim_stubs -I src -o munki_sim tools/munki_sim_test.cpp && ./munki_sim`
+- **Correction against an HPCS:** `src/munki_corr.h` (like the Torch Bearer's, shape only) is applied on the board
+  once fitted; until then it is all 1.0 and `MK_CORR_FITTED` is 0. To fit it, measure several lamps with both the
+  ColorMunki and the HPCS in the app, share each reading as CSV from History, and run
+  `tools/fit_munki_corr.py --pair munki.csv hpcs.csv --pair ... --write`. It prints the CCT/Duv error before and
+  after, and a leave-one-out check with three or more lamps. The HPCS is blurred to the ColorMunki's ~10 nm
+  bandwidth before fitting (`--bandwidth`), so the curve corrects its colour response and not the resolution it
+  cannot recover. First fit (Oct 15 2026, 6 flashlights 2680-6880 K through a parchment diffuser): leave-one-out RMS
+  error against the HPCS 40 K -> 20 K CCT, 0.0014 -> 0.0010 Duv.
+- **Raw data for high resolution:** after each reading the bridge also sends the 128 linearised sensor values (and
+  once per connection the calibration block). The app writes them to its log; `tools/munki_diag.py` extracts them.
+  They are the inputs for porting Argyll's 3.3 nm mode and checking it against real readings.
 
 ## Licence
 
