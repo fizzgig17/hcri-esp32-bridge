@@ -806,7 +806,8 @@ static bool scan_cancelled() { return ble_cancel_us > scan_started_us; }
 static bool have_result = false;
 // State 3 = no spectrometer: that is what a phone must read when it connects before one is plugged in (it becomes 0 'ready' once USB connects).
 // Bytes 6 and 7 are new: [6] meter kind (0 Torch Bearer, 1 ColorMunki), [7] ColorMunki flags: bit7 dial known, bits0-1 dial position
-// (0 projector, 1 surface, 2 calibration, 3 ambient), bit2 dark calibration done, bit3 high-gain dark references taken.
+// (0 projector, 1 surface, 2 calibration, 3 ambient), bit2 dark calibration done, bit3 high-gain dark references taken,
+// bit6 the spectrum is already corrected on the board (Torch Bearer: corr_table.h; ColorMunki: munki_corr.h).
 // Older apps read only the first 6 bytes.
 static uint8_t last_state[10] = {3, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF};
 static uint16_t (*meter_cal_age_min)() = NULL;   // ColorMunki: minutes since dark calibration (0xFFFF = none)
@@ -1619,6 +1620,7 @@ extern "C" void app_main() {
 // scan = a reading, sent as a 1 nm spectrum interpolated from the instrument's 36 bands (380-730 nm, 10 nm).
 #include "usb/usb_helpers.h"
 #include "munki_argyll.h"
+#include "munki_corr.h"   // MK_CORR_FITTED is needed by mk_flags_now() below
 
 static usb_host_client_handle_t mk_client = NULL;
 static usb_device_handle_t mk_dev = NULL;
@@ -1659,7 +1661,8 @@ static uint16_t mk_age_min() {
 
 static uint8_t mk_flags_now() {
     return (uint8_t)((mk_dial <= 3 ? (0x80 | mk_dial) : 0) | (munki::dark_valid() ? 0x04 : 0) |
-                     (munki::high_gain_ready() ? 0x08 : 0));   // bit3: high-gain dark references taken
+                     (munki::high_gain_ready() ? 0x08 : 0) |   // bit3: high-gain dark references taken
+                     (MK_CORR_FITTED ? 0x40 : 0));             // bit6: spectrum corrected on board (src/munki_corr.h)
 }
 
 // Looks at newly attached devices; returns true once a ColorMunki is open and its calibration data is read.
@@ -1696,7 +1699,6 @@ static bool mk_try_open() {
 // 36 bands at 10 nm -> 351 points at 1 nm (Catmull-Rom, clamped at zero), the grid the rest of the bridge and the app use.
 // The ColorMunki code yields mW/m^2/nm; the app (like the Torch Bearer path) expects W/m^2/nm, hence MK_UNITS.
 static const float MK_UNITS = 0.001f;
-#include "munki_corr.h"
 static void mk_fill_scan(const munki::Spectrum &s, bool low_light) {
     scan.start_nm = 380;
     scan.npts = 351;
