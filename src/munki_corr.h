@@ -5,7 +5,7 @@
 #define MK_CORR_N 351
 
 // MK_CORR_HR: fitted 2026-10-15 on 6 lamp(s), against the HPCS blurred to 4 nm: L1_munki_hr, L2_munki_hr, L3_munki_hr, L4_munki_hr, L5_munki_hr, L6_munki_hr
-#define MK_CORR_HR_FITTED 1
+#define MK_CORR_HR_FITTED 0   // 2026-10-16: off -- ColorMunki readings are the Argyll/X-Rite factory calibration as is. Set to 1 to re-enable the fit below.
 static const float MK_CORR_HR[MK_CORR_N] = {
     0.49997,0.49997,0.49997,0.49997,0.49997,0.49997,0.49997,0.49997,0.49997,0.49997,
     0.49997,0.49997,0.49997,0.51306,0.53564,0.55888,0.58264,0.60675,0.63105,0.65538,
@@ -46,7 +46,7 @@ static const float MK_CORR_HR[MK_CORR_N] = {
 };
 
 // MK_CORR: fitted 2026-10-15 on 6 lamp(s), against the HPCS blurred to 10 nm: L1_munki, L2_munki, L3_munki, L4_munki, L5_munki, L6_munki
-#define MK_CORR_FITTED 1
+#define MK_CORR_FITTED 0      // 2026-10-16: off (see MK_CORR_HR_FITTED).
 static const float MK_CORR[MK_CORR_N] = {
     0.50001,0.50001,0.50001,0.50001,0.50001,0.50001,0.50001,0.50001,0.50001,0.50001,
     0.50001,0.50001,0.51435,0.53741,0.56122,0.58559,0.61033,0.63521,0.66004,0.68460,
