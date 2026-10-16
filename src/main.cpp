@@ -932,6 +932,10 @@ static void ble_send_blob(uint8_t id, const uint8_t *d, size_t n) {
 }
 
 static int ble_gap_cb(struct ble_gap_event *ev, void *);
+// What is plugged into the bridge, sent in the advertisement so the app can show it (and hide an empty bridge) in its
+// device list without connecting: 0 nothing, 1 Torch Bearer, 2 ColorMunki. Manufacturer data = company id 0xFFFF
+// (reserved for testing), then 'h' 'C' and this byte. Old apps ignore it; old firmware simply doesn't send it.
+static uint8_t adv_attached = 0;
 static void ble_advertise() {
     struct ble_hs_adv_fields f = {};
     f.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
@@ -943,6 +947,9 @@ static void ble_advertise() {
     r.uuids128 = (ble_uuid128_t *)&SVC_UUID;
     r.num_uuids128 = 1;
     r.uuids128_is_complete = 1;
+    uint8_t mfg[5] = {0xFF, 0xFF, 'h', 'C', adv_attached};
+    r.mfg_data = mfg;
+    r.mfg_data_len = sizeof mfg;
     ble_gap_adv_rsp_set_fields(&r);
     struct ble_gap_adv_params ap = {};
     ap.conn_mode = BLE_GAP_CONN_MODE_UND;
@@ -951,6 +958,17 @@ static void ble_advertise() {
     ap.itvl_max = BLE_GAP_ADV_ITVL_MS(150);
     int rc = ble_gap_adv_start(own_addr_type, NULL, BLE_HS_FOREVER, &ap, ble_gap_cb, NULL);
     if (rc != 0 && rc != BLE_HS_EALREADY) ESP_LOGW(TAG, "adv start failed %d", rc);
+}
+
+/** Call when the plugged-in instrument changes. Restarts advertising (only when no phone is connected: a connected
+ *  bridge doesn't advertise, and the next disconnect advertises the current value). */
+static void adv_set_attached(uint8_t a) {
+    if (a == adv_attached) return;
+    adv_attached = a;
+    if (ble_conn == BLE_HS_CONN_HANDLE_NONE) {
+        ble_gap_adv_stop();
+        ble_advertise();
+    }
 }
 
 static int ble_gap_cb(struct ble_gap_event *ev, void *) {
@@ -1862,6 +1880,7 @@ static void mk_do(uint8_t dial) {
 static void mk_session() {
     munki::set_cancel_check(scan_cancelled);
     meter_kind = 1;
+    adv_set_attached(2);
     meter_cal_age_min = mk_age_min;
     strncpy(device_id, "COLORMUNKI", sizeof device_id);
     range_lo = 380;
@@ -1949,10 +1968,12 @@ extern "C" void app_main() {
         while (!usb_connected) {
             if (mk_try_open()) {
                 mk_session();
+                adv_set_attached(0);
                 ui_waiting();
                 ble_status(3, 0, 0);
             } else if (usb_try_open() && tb_init()) {
                 usb_connected = true;
+                adv_set_attached(1);
                 ESP_LOGI(TAG, "connected: %s  %d-%d nm", device_id, range_lo, range_hi);
             } else {
                 vcp.reset();
@@ -2003,6 +2024,7 @@ extern "C" void app_main() {
 
         // 3. cable pulled
         usb_connected = false;
+        adv_set_attached(0);
         vcp.reset();
         ui_waiting();
         ble_status(3, 0, 0);
