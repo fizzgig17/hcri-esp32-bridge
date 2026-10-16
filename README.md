@@ -139,17 +139,28 @@ Test with nRF Connect: connect, subscribe to result + status, write 01 to the co
 - `tools/munki_sim_test.cpp` runs the driver against a simulated instrument on a PC (bright, dim, very dim,
   saturated, and a USB read that never completes):
   `g++ -std=gnu++17 -I tools/sim_stubs -I src -o munki_sim tools/munki_sim_test.cpp && ./munki_sim`
-- **Correction against an HPCS:** `src/munki_corr.h` (like the Torch Bearer's, shape only) is applied on the board
-  once fitted; until then it is all 1.0 and `MK_CORR_FITTED` is 0. To fit it, measure several lamps with both the
+- **Correction against an HPCS:** `src/munki_corr.h` holds two curves (like the Torch Bearer's, shape only), one for
+  each spectrum: `MK_CORR_HR` for high resolution and `MK_CORR` for the standard one (low light). Each is applied on
+  the board once fitted (`MK_CORR_HR_FITTED`, `MK_CORR_FITTED`). To fit it, measure several lamps with both the
   ColorMunki and the HPCS in the app, share each reading as CSV from History, and run
-  `tools/fit_munki_corr.py --pair munki.csv hpcs.csv --pair ... --write`. It prints the CCT/Duv error before and
+  `tools/fit_munki_corr.py --mode hires --pair munki.csv hpcs.csv --pair ... --write` (`--mode standard` for the
+  low-light curve). A CSV that says the correction was applied is divided by the current curve first. It prints the CCT/Duv error before and
   after, and a leave-one-out check with three or more lamps. The HPCS is blurred to the ColorMunki's ~10 nm
   bandwidth before fitting (`--bandwidth`), so the curve corrects its colour response and not the resolution it
   cannot recover. First fit (Oct 15 2026, 6 flashlights 2680-6880 K through a parchment diffuser): leave-one-out RMS
   error against the HPCS 40 K -> 20 K CCT, 0.0014 -> 0.0010 Duv.
-- **Raw data for high resolution:** after each reading the bridge also sends the 128 linearised sensor values (and
-  once per connection the calibration block). The app writes them to its log; `tools/munki_diag.py` extracts them.
-  They are the inputs for porting Argyll's 3.3 nm mode and checking it against real readings.
+- **High resolution (3.33 nm):** ArgyllCMS's high-resolution emission mode (`munki_create_hr`: Gaussian filters
+  box-integrated over each CCD cell, placed using where the factory 10 nm filters cross over; calibration factors
+  and stray light resampled to the new bands), built from the calibration block when the instrument is opened.
+  Readings are sent at high resolution, scaled to the standard spectrum's luminance (high resolution comes out a
+  constant ~25 % brighter; lux stays on X-Rite's calibration). A reading flagged low light uses the standard 10 nm
+  spectrum instead, because the narrower bands are noisier there. Status bit 5 tells the app. Against an HPCS on
+  6 flashlights: spectral-shape error 4.9 % -> 2.5 % RMS, blue peak width 25 -> 20 nm (HPCS 19 nm), effective
+  bandwidth ~11 nm -> ~4 nm; with each mode's correction, on lamps left out of its fit: CCT 20 K -> 17 K, Duv
+  0.0010 -> 0.0008 RMS. `tools/munki_hires_check.cpp` runs it on a PC from a calibration block and readings'
+  sensor values (`tools/munki_diag.py` output).
+- **Raw data:** after each reading the bridge also sends the 128 linearised sensor values (and once per connection
+  the calibration block). The app writes them to its log; `tools/munki_diag.py` extracts them.
 
 ## Licence
 

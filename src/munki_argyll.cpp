@@ -6,6 +6,7 @@
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <utility>
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -249,6 +250,8 @@ const uint8_t *calibration_data() { return g_cal; }
 
 // Argyll munki_imp_init(): read the size at offset 4, read that many bytes from offset 0, sum the 32 bit words
 // with the stored checksum (at offset 8) zeroed, and compare.
+static bool build_hires();
+
 bool read_calibration(Eeprom *e) {
     memset(e, 0, sizeof *e);
     free(g_cal);
@@ -273,6 +276,7 @@ bool read_calibration(Eeprom *e) {
     e->cal_version = (int)(b[0] | (b[1] << 8));
     e->compat_version = (int)(b[2] | (b[3] << 8));
     g_cal = b;   // kept (with the checksum word zeroed, as Argyll does) for the parser
+    if (e->sum_ok) build_hires();
     return true;
 }
 
@@ -589,6 +593,288 @@ static bool compute_spectrum(const Raw &r, Mode mode, float *out) {
 
 const float *last_absraw() { return g_last_absraw; }
 
+// ----------------------------------------------------------------------------------------------------------
+// High-resolution emission spectrum (3.33 nm), after ArgyllCMS munki_create_hr() for emission with its defaults
+// (Gaussian filter shape, BOX_INTEGRATE, DO_CCDNORM + DO_CCDNORMAVG, ONEDSTRAYLIGHTUS). Built once from the
+// calibration block when it is read:
+//   1. where neighbouring factory 10 nm filters cross over gives the wavelength of points on the CCD; a cubic spline
+//      through them maps any CCD cell to its wavelength (Argyll fits an rspl here);
+//   2. one narrow filter per 3.33 nm band, each the Gaussian of HR_WIDTH integrated over every CCD cell's wavelength
+//      span (Argyll's box integration);
+//   3. the filters are scaled so their average CCD weight matches the factory filters' (x 10 / HR_WIDTH);
+//   4. the mode's calibration factors are resampled to the new bands (a cubic spline; Argyll fits an rspl) and the
+//      stray-light matrix is resampled linearly, as Argyll's standalone build does.
+// Below 400 nm Argyll repeats the 400 nm band (too noisy); so does this.
+static const int HR_N = 106;                       // (730 - 380) / 3.333 + 1
+static const double HR_WIDTH = 10.0 / 3.0;
+static const double HR_SHORT = 380.0, HR_LONG = 730.0, HR_MIN_WL = 400.0;
+static const int HR_MAXCOEF = 12;                  // a ColorMunki's widest band uses 7 CCD cells
+
+static bool g_hr_ok = false;
+static double hr_stray_off(int i, int j);
+static int g_hr_start[HR_N], g_hr_count[HR_N];
+static float g_hr_coef[HR_N][HR_MAXCOEF];
+static float g_hr_slp[36][36];                     // stray light with the near-diagonal entries interpolated
+static float g_hr_diag[HR_N];                      // diagonal of the resampled stray-light matrix
+static float g_last_hr[HR_N];
+
+static double hr_wl(int j) { return HR_SHORT + j * (HR_LONG - HR_SHORT) / (HR_N - 1.0); }
+
+// Natural cubic spline through (x[i], y[i]), x ascending; evaluated with extrapolation of the end cubics.
+struct Spline {
+    int n;
+    double x[40], y[40], m[40];   // m = second derivatives
+    void fit(const double *xs, const double *ys, int cnt) {
+        n = cnt;
+        for (int i = 0; i < n; i++) { x[i] = xs[i]; y[i] = ys[i]; }
+        double u[40];
+        m[0] = u[0] = 0;
+        for (int i = 1; i < n - 1; i++) {
+            double sig = (x[i] - x[i - 1]) / (x[i + 1] - x[i - 1]);
+            double p = sig * m[i - 1] + 2.0;
+            m[i] = (sig - 1.0) / p;
+            u[i] = (y[i + 1] - y[i]) / (x[i + 1] - x[i]) - (y[i] - y[i - 1]) / (x[i] - x[i - 1]);
+            u[i] = (6.0 * u[i] / (x[i + 1] - x[i - 1]) - sig * u[i - 1]) / p;
+        }
+        m[n - 1] = 0;
+        for (int k = n - 2; k >= 0; k--) m[k] = m[k] * m[k + 1] + u[k];
+    }
+    double at(double v) const {
+        int k = 0;
+        if (v >= x[n - 1]) k = n - 2;
+        else if (v > x[0]) { k = 0; while (k < n - 2 && x[k + 1] < v) k++; }
+        double h = x[k + 1] - x[k], a = (x[k + 1] - v) / h, b = (v - x[k]) / h;
+        return a * y[k] + b * y[k + 1] + ((a * a * a - a) * m[k] + (b * b * b - b) * m[k + 1]) * (h * h) / 6.0;
+    }
+};
+
+// Argyll lanczos2() with USE_GAUSSIAN: a Gaussian of the given width, 1.0 at the centre.
+static double hr_shape(double wi, double x) {
+    wi = wi / sqrt(2.0 * log(2.0));
+    x = x / wi;
+    return exp(-(x * x));
+}
+
+static bool build_hires() {
+    g_hr_ok = false;
+    const uint8_t *e = g_cal;
+    if (!e) return false;
+    // Working memory only needed while building (the main task's stack is small): on the heap, freed on return.
+    struct C { int ix; double we; };
+    struct Work { C coeff[36][16]; double ccd[2][NRAW]; };
+    Work *wk = (Work *)calloc(1, sizeof(Work));
+    if (!wk) return false;
+    struct Guard { Work *p; ~Guard() { free(p); } } guard{wk};
+    C (*coeff)[16] = wk->coeff;
+    double (*ccd)[NRAW] = wk->ccd;
+    // Factory filters (36 x 16 at 10 nm), skipping the duplicated ones at the short end, as Argyll does.
+    int nw = 36, jj = 0;
+    double ws = 380.0;
+    const double wlong = 730.0;
+    for (int j = 0; j < 36; j++) {
+        int sx = buf2int(e + 2488 + j * 4);
+        if (sx < 0 || sx + 16 > NRAW) return false;
+        if (j < 35 && sx == buf2int(e + 2488 + (j + 1) * 4)) { ws += 10.0; nw--; continue; }
+        for (int k = 0; k < 16; k++) coeff[jj][k] = {sx + k, f32at(e, 2632 + (j * 16 + k) * 4)};
+        jj++;
+    }
+    if (nw < 4) return false;
+    auto wl1 = [&](double i) { return ws + i * (wlong - ws) / (nw - 1.0); };
+    // 1. Crossover points between neighbouring filters (raw index, wavelength).
+    double xr[40], xw[40], xy[40];
+    const double eps = 1e-6;
+    for (int i = 0; i < nw - 1; i++) {
+        double best = -1e6;
+        for (int j = 0; j < 15; j++)
+            for (int k = 0; k < 15; k++) {
+                if (coeff[i][j].ix != coeff[i + 1][k].ix || coeff[i][j + 1].ix != coeff[i + 1][k + 1].ix) continue;
+                double y1 = coeff[i][j].we, y2 = coeff[i][j + 1].we, y3 = coeff[i + 1][k].we, y4 = coeff[i + 1][k + 1].we;
+                double den = -y4 + y3 + y2 - y1;
+                if (fabs(den) < eps) continue;
+                double yn = (y2 * y3 - y1 * y4) / den, xn = (y3 - y1) / den;
+                if (xn < -eps || xn > 1.0 + eps) continue;
+                if (yn > best) {
+                    xw[i + 1] = wl1(i + 0.5);
+                    xr[i + 1] = (1.0 - xn) * coeff[i][j].ix + xn * coeff[i][j + 1].ix;
+                    xy[i + 1] = yn;
+                    best = yn;
+                }
+            }
+        if (best < 0.0) { ESP_LOGW(TAGM, "high res: no crossover %d", i); return false; }
+    }
+    for (int end = 0; end < 2; end++) {   // extrapolated crossovers outside the first and last filter
+        int a = end ? nw - 2 : 1, b = end ? nw - 1 : 2, f = end ? nw - 1 : 0, pos = end ? nw : 0;
+        double x5 = xr[a], y5 = xy[a], x6 = xr[b], y6 = xy[b], y1 = 0, y2 = 0, y3 = 0, y4 = 0;
+        int j;
+        for (j = 0; j < 15; j++) {
+            y3 = y5 + (coeff[f][j].ix - x5) / (x6 - x5) * (y6 - y5);
+            y4 = y5 + (coeff[f][j + 1].ix - x5) / (x6 - x5) * (y6 - y5);
+            y1 = coeff[f][j].we;
+            y2 = coeff[f][j + 1].we;
+            double c0 = coeff[f][j].ix, c1 = coeff[f][j + 1].ix;
+            if (((y1 >= y3 && y2 <= y4) || (y1 <= y3 && y2 >= y4)) &&
+                ((c0 < x5 && c0 < x6 && c1 < x5 && c1 < x6) || (c1 > x5 && c1 > x6 && c0 > x5 && c0 > x6))) break;
+        }
+        if (j >= 15) { ESP_LOGW(TAGM, "high res: no end crossover"); return false; }
+        double den = -y4 + y3 + y2 - y1;
+        double xn = (y3 - y1) / den;
+        xw[pos] = wl1(end ? nw - 0.5 : -0.5);
+        xr[pos] = (1.0 - xn) * coeff[f][j].ix + xn * coeff[f][j + 1].ix;
+    }
+    // Spline raw index -> wavelength (sorted by raw index).
+    int np = nw + 1;
+    double sr[40], sw[40];
+    for (int i = 0; i < np; i++) { sr[i] = xr[i]; sw[i] = xw[i]; }
+    for (int i = 1; i < np; i++)
+        for (int k = i; k > 0 && sr[k] < sr[k - 1]; k--) { std::swap(sr[k], sr[k - 1]); std::swap(sw[k], sw[k - 1]); }
+    static Spline r2w;
+    r2w.fit(sr, sw, np);
+    // 2. Narrow filters: the Gaussian integrated over each CCD cell's wavelength span (0.05 nm steps).
+    double fshmax = 50.0;
+    for (; fshmax >= 0.0; fshmax -= 0.1)
+        if (fabs(hr_shape(HR_WIDTH, fshmax)) > 0.001) { fshmax += 0.1; break; }
+    for (int j = 0; j < HR_N; j++) g_hr_count[j] = 0;
+    for (int i = 0; i < NRAW; i++) {
+        double w1 = r2w.at(i - 0.5), w2 = r2w.at(i + 0.5);
+        for (int j = 0; j < HR_N; j++) {
+            double cwl = hr_wl(j);
+            if (cwl < HR_MIN_WL) cwl = HR_MIN_WL;
+            if (fabs(w1 - cwl) > fshmax && fabs(w2 - cwl) > fshmax) continue;
+            int nn = (int)(fabs(w2 - w1) / 0.05 + 0.5);
+            double lw = w1, ll = hr_shape(HR_WIDTH, w1 - cwl), we = 0.0;
+            for (int k = 0; k < nn; k++) {
+                double cw = w1 + (k + 1.0) / (nn + 1.0) * (w2 - w1);
+                double cl = hr_shape(HR_WIDTH, cw - cwl);
+                we += 0.5 * (cl + ll) * (lw - cw);
+                ll = cl;
+                lw = cw;
+            }
+            if (g_hr_count[j] >= HR_MAXCOEF) { ESP_LOGW(TAGM, "high res: filter too wide"); return false; }
+            if (g_hr_count[j] == 0) g_hr_start[j] = i;
+            else if (g_hr_start[j] + g_hr_count[j] != i) { ESP_LOGW(TAGM, "high res: filter not contiguous"); return false; }
+            g_hr_coef[j][g_hr_count[j]++] = (float)we;
+        }
+    }
+    for (int j = 0; j < HR_N; j++) if (g_hr_count[j] == 0) { ESP_LOGW(TAGM, "high res: empty band %d", j); return false; }
+    // 3. DO_CCDNORM + DO_CCDNORMAVG: scale so the average CCD weight matches the factory filters'.
+    for (int j = 0; j < 36; j++) {
+        int sx = buf2int(e + 2488 + j * 4);
+        if (j < 34 && sx == buf2int(e + 2488 + (j + 1) * 4)) continue;
+        for (int k = 0; k < 16; k++) ccd[0][sx + k] += f32at(e, 2632 + (j * 16 + k) * 4);
+    }
+    for (int j = 0; j < HR_N; j++) {
+        if (j < HR_N - 2 && g_hr_start[j] == g_hr_start[j + 1]) continue;
+        for (int k = 0; k < g_hr_count[j]; k++) ccd[1][g_hr_start[j] + k] += g_hr_coef[j][k];
+    }
+    double avg[2] = {0, 0};
+    const double dth[2] = {0.0, 0.007};
+    for (int k = 0; k < 2; k++) {
+        double mx = 0;
+        int mi = 0;
+        for (int i = 0; i < NRAW; i++) if (ccd[k][i] > mx) { mx = ccd[k][i]; mi = i; }
+        double x[4] = {(double)mi, 0, 0, (double)mi}, y[4];
+        for (int i = mi; i >= 0 && ccd[k][i] > 0.8 * mx; i--) x[0] = i;
+        for (int i = mi; i < NRAW && ccd[k][i] > 0.8 * mx; i++) x[3] = i;
+        x[0] += 2.0;
+        x[3] -= 6.0;
+        x[1] = floor((2 * x[0] + x[3]) / 3.0);
+        x[2] = floor((x[0] + 2 * x[3]) / 3.0);
+        for (int i = 0; i < 4; i++) y[i] = ccd[k][(int)x[i]];
+        for (int i = 0; i < NRAW; i++) {
+            double xw2 = i, yw = 0;
+            for (int a = 0; a < 4; a++) {
+                double t = y[a];
+                for (int b = 0; b < 4; b++) if (b != a) t *= (xw2 - x[b]) / (x[a] - x[b]);
+                yw += t;
+            }
+            // As in C Argyll, coincident points give inf/NaN here and the test below is then simply false.
+            if ((xw2 < x[0] || xw2 > x[3]) && yw == yw && yw != 0 && fabs(ccd[k][i] - yw) / yw > dth[k]) ccd[k][i] = yw;
+            avg[k] += ccd[k][i];
+        }
+        avg[k] /= NRAW;
+    }
+    if (!(avg[1] > 0)) return false;
+    const double scale = 10.0 / HR_WIDTH * avg[0] / avg[1];
+    for (int j = 0; j < HR_N; j++) for (int k = 0; k < g_hr_count[j]; k++) g_hr_coef[j][k] = (float)(g_hr_coef[j][k] * scale);
+    // 4. Stray light (ONEDSTRAYLIGHTUS): near-diagonal entries interpolated from further out (with Argyll's integer
+    // division for the weight), resampled linearly, scaled by HR_WIDTH / 10, positive values dropped, and each row's
+    // diagonal set so the row sums to 1.
+    const double td = u16at(e, 0) >= 4 ? f32at(e, 8020) : 0.001;
+    auto s1 = [&](int i, int j) { return td * (int16_t)u16at(e, 5428 + (i * 36 + j) * 2) + (i == j ? 1.0 : 0.0); };
+    for (int i = 0; i < 36; i++)
+        for (int j = 0; j < 36; j++) {
+            double v = s1(i, j);
+            if (j == i - 1 || j == i || j == i + 1) {
+                int j0, j1;
+                if (j == i - 1) { if (j <= 0) j0 = j + 3, j1 = j + 4; else if (j >= 33) j0 = j - 2, j1 = j - 1; else j0 = j - 1, j1 = j + 3; }
+                else if (j == i) { if (j <= 1) j0 = j + 2, j1 = j + 3; else if (j >= 34) j0 = j - 3, j1 = j - 2; else j0 = j - 2, j1 = j + 2; }
+                else { if (j <= 2) j0 = j + 1, j1 = j + 2; else if (j >= 35) j0 = j - 4, j1 = j - 3; else j0 = j - 3, j1 = j + 1; }
+                double w1 = (j - j0) / (j1 - j0);   // int / int, as in Argyll
+                v = (1.0 - w1) * s1(i, j0) + w1 * s1(i, j1);
+            }
+            g_hr_slp[i][j] = (float)v;
+        }
+    for (int i = 0; i < HR_N; i++) {
+        double sum = 0;
+        for (int j = 0; j < HR_N; j++) if (j < i - 1 || j > i + 1) sum += hr_stray_off(i, j);
+        g_hr_diag[i] = (float)(1.0 - sum);
+    }
+    g_hr_ok = true;
+    ESP_LOGI(TAGM, "high res: %d bands at %.2f nm ready", HR_N, HR_WIDTH);
+    return true;
+}
+
+// Off-diagonal stray-light weight of input band j on output band i (bilinear in the 36 x 36 table, <= 0).
+static double hr_stray_off(int i, int j) {
+    double p0 = hr_wl(i), p1 = hr_wl(j);
+    if (p0 < HR_MIN_WL) p0 = HR_MIN_WL;
+    if (p1 < HR_MIN_WL) p1 = HR_MIN_WL;
+    double xx = 35.0 * (p0 - 380.0) / 350.0, yy = 35.0 * (p1 - 380.0) / 350.0;
+    int x0 = (int)floor(xx), y0 = (int)floor(yy);
+    if (x0 < 0) x0 = 0; else if (x0 > 34) x0 = 34;
+    if (y0 < 0) y0 = 0; else if (y0 > 34) y0 = 34;
+    double w1 = xx - x0, w0 = 1 - w1, v1 = yy - y0, v0 = 1 - v1;
+    double v = w0 * v0 * g_hr_slp[x0][y0] + w0 * v1 * g_hr_slp[x0][y0 + 1] + w1 * v0 * g_hr_slp[x0 + 1][y0] + w1 * v1 * g_hr_slp[x0 + 1][y0 + 1];
+    v *= HR_WIDTH / 10.0;
+    return v > 0.0 ? 0.0 : v;
+}
+
+bool hires_ready() { return g_hr_ok; }
+int hires_bands() { return HR_N; }
+double hires_wavelength(int j) { return hr_wl(j); }
+const float *last_hires() { return g_last_hr; }
+
+// 106-band spectrum (380-730 nm, 3.33 nm steps) from the 128 linearised sensor values, in the same units as the
+// standard spectrum for the mode.
+bool hires_spectrum(const float *absraw, Mode mode, float *out) {
+    if (!g_hr_ok || !g_cal) return false;
+    const uint8_t *e = g_cal;
+    int cal_off = mode == MODE_AMBIENT ? 5256 : mode == MODE_EMISSION ? 5112 : 8024;
+    double cx[36], cy[36];
+    for (int j = 0; j < 36; j++) {
+        cx[j] = 380.0 + 10.0 * j;
+        cy[j] = f32at(e, cal_off + j * 4);
+        if (cy[j] != cy[j]) return false;
+    }
+    static Spline cs;
+    cs.fit(cx, cy, 36);
+    static double tm[HR_N];
+    for (int j = 0; j < HR_N; j++) {
+        double o = 0;
+        for (int k = 0; k < g_hr_count[j]; k++) o += g_hr_coef[j][k] * absraw[g_hr_start[j] + k];
+        tm[j] = o;
+    }
+    for (int i = 0; i < HR_N; i++) {
+        double o = g_hr_diag[i] * tm[i];
+        for (int j = 0; j < HR_N; j++) if (j < i - 1 || j > i + 1) o += hr_stray_off(i, j) * tm[j];
+        double w = hr_wl(i);
+        double cf = cs.at(w < HR_MIN_WL ? HR_MIN_WL : w);
+        out[i] = (float)(o * (cf < 0 ? 0 : cf));
+    }
+    return true;
+}
+
+
 // Argyll munki_optimise_sensor(): from the current integration time / gain and the scale that would bring the
 // signal to the target, the integration time and gain to use next. *fill = expected signal as a fraction of the
 // target (1 = on target; well below 1 = still dim).
@@ -663,6 +949,7 @@ Result measure_spectrum(Mode mode, Spectrum *out) {
     out->inttime = r.inttime;
     out->nmeas = n;
     out->gain = r.gain;
+    out->hires = hires_spectrum(g_last_absraw, mode, g_last_hr);
     out->signal = signal;
     int pk = 0;
     for (int j = 1; j < 36; j++) if (out->v[j] > out->v[pk]) pk = j;
