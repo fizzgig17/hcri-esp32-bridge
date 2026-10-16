@@ -80,6 +80,7 @@ struct Spectrum {
     double inttime;          // integration time used (seconds)
     int nmeas;               // readings averaged
     int gain;                // 0 normal, 1 high gain (only in very dim light)
+    bool hires;              // last_hires() holds the 3.33 nm version of this reading
     double signal;           // peak raw signal above the dark level (counts)
     int peak_nm;             // wavelength of the strongest band
 };
@@ -90,6 +91,14 @@ bool dark_valid();
 bool high_gain_ready();
 // The 128 dark-subtracted, linearised sensor values (per second) behind the last spectrum, for diagnostics.
 const float *last_absraw();
+
+// ---- High resolution (ArgyllCMS's 3.33 nm emission mode), built from the calibration block when it is read ----
+bool hires_ready();
+int hires_bands();                     // 106: 380-730 nm (below 400 nm repeats the 400 nm band, as Argyll does)
+double hires_wavelength(int band);
+// The 3.33 nm spectrum from 128 linearised sensor values, in the mode's units (as Spectrum::v). False if unavailable.
+bool hires_spectrum(const float *absraw, Mode mode, float *out);
+const float *last_hires();             // the last reading's, valid when Spectrum::hires
 // Seconds since the last successful dark calibration, or 0xFFFFFFFF when there is none.
 uint32_t dark_age_s();
 // Dial must already be on the matching position. MR_LOW_LIGHT still returns a usable spectrum.

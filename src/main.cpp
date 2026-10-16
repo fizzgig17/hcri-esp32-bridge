@@ -807,6 +807,7 @@ static bool have_result = false;
 // State 3 = no spectrometer: that is what a phone must read when it connects before one is plugged in (it becomes 0 'ready' once USB connects).
 // Bytes 6 and 7 are new: [6] meter kind (0 Torch Bearer, 1 ColorMunki), [7] ColorMunki flags: bit7 dial known, bits0-1 dial position
 // (0 projector, 1 surface, 2 calibration, 3 ambient), bit2 dark calibration done, bit3 high-gain dark references taken,
+// bit5 (ColorMunki) readings are high resolution (3.33 nm; standard 10 nm when the reading is flagged low light),
 // bit6 the spectrum is already corrected on the board (Torch Bearer: corr_table.h; ColorMunki: munki_corr.h).
 // Older apps read only the first 6 bytes.
 static uint8_t last_state[10] = {3, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF};
@@ -1662,7 +1663,8 @@ static uint16_t mk_age_min() {
 static uint8_t mk_flags_now() {
     return (uint8_t)((mk_dial <= 3 ? (0x80 | mk_dial) : 0) | (munki::dark_valid() ? 0x04 : 0) |
                      (munki::high_gain_ready() ? 0x08 : 0) |   // bit3: high-gain dark references taken
-                     (MK_CORR_FITTED ? 0x40 : 0));             // bit6: spectrum corrected on board (src/munki_corr.h)
+                     (munki::hires_ready() ? 0x20 : 0) |      // bit5: high resolution (3.33 nm) readings
+                     ((MK_CORR_FITTED && MK_CORR_HR_FITTED) ? 0x40 : 0));   // bit6: spectrum corrected on board (munki_corr.h)
 }
 
 // Looks at newly attached devices; returns true once a ColorMunki is open and its calibration data is read.
@@ -1699,26 +1701,58 @@ static bool mk_try_open() {
 // 36 bands at 10 nm -> 351 points at 1 nm (Catmull-Rom, clamped at zero), the grid the rest of the bridge and the app use.
 // The ColorMunki code yields mW/m^2/nm; the app (like the Torch Bearer path) expects W/m^2/nm, hence MK_UNITS.
 static const float MK_UNITS = 0.001f;
+// Catmull-Rom from n bands (band k at first + k * step nm) onto the 1 nm grid 380..730, clamped at zero.
+static void mk_to_1nm(const float *v, int n, double first, double step, float *out) {
+    for (int i = 0; i < 351; i++) {
+        double x = (380 + i - first) / step;
+        int k = (int)floor(x);
+        if (k < 0) k = 0;
+        if (k > n - 2) k = n - 2;
+        float t = (float)(x - k);
+        float p0 = v[k > 0 ? k - 1 : 0], p1 = v[k], p2 = v[k + 1], p3 = v[k + 2 < n ? k + 2 : n - 1];
+        float r = 0.5f * ((2 * p1) + (-p0 + p2) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t * t + (-p0 + 3 * p1 - 3 * p2 + p3) * t * t * t);
+        out[i] = r < 0 ? 0 : r;
+    }
+}
+
+static double mk_lum(const float *spd) {   // relative photopic luminance of a 380..730 nm, 1 nm spectrum
+    double y = 0;
+    for (int i = 0; i < 351; i++) y += spd[i] * tbm::interp5(CMF_Y, 380 + i);
+    return y;
+}
+
+// The reading as the app gets it: 1 nm, 380-730 nm, W/m^2/nm. Normally the high-resolution (3.33 nm) spectrum,
+// scaled to the standard one's luminance (so lux stays on X-Rite's calibration; the two differ by a constant ~25 %);
+// in low light the standard 10 nm one, because the narrower bands are noisier there. Each has its own HPCS-fitted
+// shape correction (src/munki_corr.h). The app never applies its own curve to ColorMunki readings.
+static bool mk_last_hires = false;
 static void mk_fill_scan(const munki::Spectrum &s, bool low_light) {
+    static float std1[351], hr1[351];
     scan.start_nm = 380;
     scan.npts = 351;
     scan.exposure_ms = (float)(s.inttime * 1000.0);
     scan.status = low_light ? 2 : 0;
-    for (int i = 0; i < 351; i++) {
-        int seg = i / 10;
-        float t = (i % 10) / 10.0f;
-        if (seg >= 35) { scan.spd[i] = (s.v[35] < 0 ? 0 : s.v[35]) * MK_UNITS; continue; }
-        float p0 = s.v[seg > 0 ? seg - 1 : 0], p1 = s.v[seg], p2 = s.v[seg + 1], p3 = s.v[seg + 2 < 36 ? seg + 2 : 35];
-        float v = 0.5f * ((2 * p1) + (-p0 + p2) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t * t + (-p0 + 3 * p1 - 3 * p2 + p3) * t * t * t);
-        scan.spd[i] = (v < 0 ? 0 : v) * MK_UNITS;
+    mk_to_1nm(s.v, 36, 380.0, 10.0, std1);
+    mk_last_hires = s.hires && !low_light;
+    const float *src = std1;
+    if (mk_last_hires) {
+        int n = munki::hires_bands();
+        mk_to_1nm(munki::last_hires(), n, munki::hires_wavelength(0), munki::hires_wavelength(1) - munki::hires_wavelength(0), hr1);
+        double ys = mk_lum(std1), yh = mk_lum(hr1);
+        float k = (ys > 0 && yh > 0) ? (float)(ys / yh) : 1.0f;
+        for (int i = 0; i < 351; i++) hr1[i] *= k;
+        src = hr1;
     }
-#if MK_CORR_FITTED
-    // HPCS-fitted shape correction (src/munki_corr.h). The app never applies its own curve to ColorMunki readings.
     for (int i = 0; i < 351; i++) {
-        int k = 380 + i - MK_CORR_FIRST_NM;
-        scan.spd[i] *= MK_CORR[k < 0 ? 0 : k >= MK_CORR_N ? MK_CORR_N - 1 : k];
-    }
+        float c = 1.0f;
+#if MK_CORR_HR_FITTED
+        if (mk_last_hires) c = MK_CORR_HR[i];
 #endif
+#if MK_CORR_FITTED
+        if (!mk_last_hires) c = MK_CORR[i];
+#endif
+        scan.spd[i] = src[i] * c * MK_UNITS;
+    }
 }
 
 // Raw data behind a reading, for developing the high-resolution mode offline (tools/munki_diag.py decodes it).
