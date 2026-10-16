@@ -18,10 +18,10 @@ struct Metrics {
 };
 
 // ---- correction -----------------------------------------------------------
-// 0 = show/send the raw spectrum; 1 = apply the fitted curve (default: the app no longer applies it for this firmware,
-// the status flag bit 6 tells it so).
+// 0 = send the spectrum exactly as the Torch Bearer reports it (what tobes-ui, the open-source tool, shows -- it applies no calibration);
+// 1 = apply the HPCS-fitted curve. Default 0 since 2026-10-16 (the status flag bit 6 tells the app which one it got).
 #ifndef TB_APPLY_CORRECTION
-#define TB_APPLY_CORRECTION 1
+#define TB_APPLY_CORRECTION 0
 #endif
 // Multiplies a raw spectrum (1 nm steps from start_nm) by the HPCS-fitted curve.
 static inline void apply_correction(float *spd, int npts, int start_nm) {
