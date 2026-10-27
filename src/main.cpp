@@ -2003,6 +2003,7 @@ static bool tk_probe() {
     }
     if (!found) {
         usb_set_baud(115200);
+        if (vcp) vcp->set_control_line_state(true, true);   // as usb_try_open() leaves it, in case the baud change touched the lines
         xStreamBufferReset(rx_stream);
         tkn = 0;
     }
