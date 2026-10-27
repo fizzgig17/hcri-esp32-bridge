@@ -2,8 +2,10 @@
 
 Step-by-step setup guide with buying links: <https://www.hcri.io/companion/bridge/>
 
-The same firmware drives a **Torch Bearer** (CH340 serial) or an **X-Rite ColorMunki Photo / Design** (USB 0971:2007) and
-auto-detects which is plugged in. The ColorMunki is measured in ambient mode only, after a dark calibration (dial in the
+The same firmware drives a **Torch Bearer** (CH340 serial), an **X-Rite ColorMunki Photo / Design** (USB 0971:2007) or a
+**TKLamp TK2303D integrating-sphere tester** (CH340 serial at 9600 baud; live lumen readings) and auto-detects which is
+plugged in. The TKLamp is recognised by the frames it streams on its own (about 4.5 a second); anything else on the CH340 is
+treated as a Torch Bearer. The ColorMunki is measured in ambient mode only, after a dark calibration (dial in the
 calibration position); the app can require recalibration after a set time (Settings, default 1 h).
 
 Press the right button (GPIO14) or BOOT: the board asks the Torch Bearer for one
