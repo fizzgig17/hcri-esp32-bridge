@@ -783,6 +783,8 @@ static bool tb_scan(progress_fn progress, int timeout_s) {
 //   header   : 02 | npts u16 | start_nm u16 | step_nm u8 | total_bytes u16     (then float32 values)
 //   data     : 03 | seq u8 | bytes...                                          (seq counts from 0)
 //   end      : 04 | chunks u8
+//   live     : 06 | ms u32 | raw u32   (TKLamp tester only: one reading about every 220 ms, ms = board uptime, raw = the
+//              tester's sensor count, lumens = raw / ~313.2 on a calibrated tester; scaling is done in the app)
 //   diag     : 05 | id u8 | seq u8 | last u8 | bytes...   (ColorMunki diagnostics, sent after the end marker; apps that
 //              don't know 05 ignore it. id 1 = the reading's raw sensor data, id 2 = the instrument's calibration
 //              block, once per connection. Used to develop the high-resolution mode offline; see tools/munki_diag.py.)
@@ -805,7 +807,7 @@ static int64_t scan_started_us = 0;
 static bool scan_cancelled() { return ble_cancel_us > scan_started_us; }
 static bool have_result = false;
 // State 3 = no spectrometer: that is what a phone must read when it connects before one is plugged in (it becomes 0 'ready' once USB connects).
-// Bytes 6 and 7 are new: [6] meter kind (0 Torch Bearer, 1 ColorMunki), [7] ColorMunki flags: bit7 dial known, bits0-1 dial position
+// Bytes 6 and 7 are new: [6] meter kind (0 Torch Bearer, 1 ColorMunki, 2 TKLamp tester: live readings, packet 06), [7] ColorMunki flags: bit7 dial known, bits0-1 dial position
 // (0 projector, 1 surface, 2 calibration, 3 ambient), bit2 dark calibration done, bit3 high-gain dark references taken,
 // bit5 (ColorMunki) readings are high resolution (3.33 nm; standard 10 nm when the reading is flagged low light),
 // bit6 the spectrum is already corrected on the board (Torch Bearer: corr_table.h; ColorMunki: munki_corr.h).
@@ -933,7 +935,7 @@ static void ble_send_blob(uint8_t id, const uint8_t *d, size_t n) {
 
 static int ble_gap_cb(struct ble_gap_event *ev, void *);
 // What is plugged into the bridge, sent in the advertisement so the app can show it (and hide an empty bridge) in its
-// device list without connecting: 0 nothing, 1 Torch Bearer, 2 ColorMunki. Manufacturer data = company id 0xFFFF
+// device list without connecting: 0 nothing, 1 Torch Bearer, 2 ColorMunki, 3 TKLamp tester. Manufacturer data = company id 0xFFFF
 // (reserved for testing), then 'h' 'C' and this byte. Old apps ignore it; old firmware simply doesn't send it.
 static uint8_t adv_attached = 0;
 static void ble_advertise() {
@@ -1170,7 +1172,7 @@ static void draw_btn_note() {
 }
 
 static void header(const char *right, uint16_t rc) {
-    text(6, 4, meter_kind == 1 ? "COLORMUNKI" : hdr_generic ? "HCRI BRIDGE" : "TORCH BEARER", 2, WHITE);
+    text(6, 4, meter_kind == 1 ? "COLORMUNKI" : meter_kind == 2 ? "TKLAMP" : hdr_generic ? "HCRI BRIDGE" : "TORCH BEARER", 2, WHITE);
     // On the arrow screens the upright arrow owns the top-right corner, so the right-hand status steps left of it.
     int edge = (shown != 0 && !arrow_bottom_left()) ? W - 24 : W - 6;
     text(edge - (int)strlen(right) * 12, 4, right, 2, rc);
@@ -1184,8 +1186,9 @@ static void ui_waiting() {
     hdr_generic = true;
     header("NO USB", RED);
     hdr_generic = false;
-    text(20, 70, "PLUG IN SPECTROMETER", 2, YELLOW);
-    text(20, 100, "VIA OTG CABLE", 2, GREY);
+    text(20, 48, "PLUG IN AN INSTRUMENT", 2, YELLOW);
+    text(20, 74, "TORCH BEARER, COLORMUNKI", 2, GREY);
+    text(20, 94, "OR TKLAMP, VIA OTG CABLE", 2, GREY);
     waiting_shown = true;
     draw_btn_note();
     textf(6, 160, 1, GREY, "FW %s", FW_VERSION);
@@ -1944,6 +1947,138 @@ static void mk_session() {
     have_result = false;
 }
 
+// ----------------------------------------------------- TKLamp tester ----
+// The TKLamp TK2303D integrating-sphere tester (CH340 serial, 9600 8N1) streams one 15-byte frame about every 220 ms while
+// it is plugged in, without being asked:
+//   a5 0a af a5 09 ae 5a 5a 09 04 00 | v2 v1 v0 | cs        (v = 24-bit big-endian sensor count, cs = v2+v1+v0-0x3f)
+// On a calibrated tester lumens = count / ~313.2 (measured against its 2150 lm calibration lamp). The firmware passes the
+// raw count on (BLE packet 06) and only converts for the screen; the app owns the scale.
+static const uint8_t TK_HDR[11] = {0xA5, 0x0A, 0xAF, 0xA5, 0x09, 0xAE, 0x5A, 0x5A, 0x09, 0x04, 0x00};
+#define TK_FRAME 15
+#define TK_RAW_PER_LM 313.2f
+
+static void usb_set_baud(uint32_t baud) {
+    if (!vcp) return;
+    cdc_acm_line_coding_t lc = {};
+    lc.dwDTERate = baud;
+    lc.bCharFormat = 0;
+    lc.bParityType = 0;
+    lc.bDataBits = 8;
+    if (vcp->line_coding_set(&lc) != ESP_OK) ESP_LOGW(TAG, "line_coding_set %u failed", (unsigned)baud);
+}
+
+static uint8_t tkb[64];
+static size_t tkn = 0;
+// Pull bytes from the USB stream and return the next valid frame's 24-bit count, or -1 if none is complete yet.
+static int64_t tk_next(int wait_ms) {
+    while (true) {
+        while (tkn >= TK_FRAME) {
+            if (memcmp(tkb, TK_HDR, sizeof TK_HDR) == 0 &&
+                (uint8_t)(tkb[11] + tkb[12] + tkb[13] - 0x3F) == tkb[14]) {
+                int64_t v = ((int64_t)tkb[11] << 16) | (tkb[12] << 8) | tkb[13];
+                memmove(tkb, tkb + TK_FRAME, tkn - TK_FRAME);
+                tkn -= TK_FRAME;
+                return v;
+            }
+            memmove(tkb, tkb + 1, --tkn);   // resync one byte at a time
+        }
+        size_t got = xStreamBufferReceive(rx_stream, tkb + tkn, sizeof tkb - tkn, pdMS_TO_TICKS(wait_ms));
+        if (!got) return -1;
+        tkn += got;
+        wait_ms = 1;   // got bytes: only look again briefly
+    }
+}
+
+/** After a CH340 opened and did not answer as a Torch Bearer: is it the TKLamp tester? Listens at 9600 baud for a valid
+ *  frame. Leaves the port at 115200 on a miss, so the next attempt starts from the usual state. */
+static bool tk_probe() {
+    usb_set_baud(9600);
+    xStreamBufferReset(rx_stream);
+    tkn = 0;
+    int64_t until = esp_timer_get_time() + 2000000;
+    bool found = false;
+    while (esp_timer_get_time() < until) {
+        if (tk_next(200) >= 0) { found = true; break; }
+        if (usb_lost) break;
+    }
+    if (!found) {
+        usb_set_baud(115200);
+        if (vcp) vcp->set_control_line_state(true, true);   // as usb_try_open() leaves it, in case the baud change touched the lines
+        xStreamBufferReset(rx_stream);
+        tkn = 0;
+    }
+    return found;
+}
+
+static void ui_tk(float lm, bool have, bool stale) {
+    clear();
+    header(stale ? "NO DATA" : "LIVE", stale ? RED : GREEN);
+    if (have && !stale) {
+        char s[16];
+        snprintf(s, sizeof s, "%.0f", lm);
+        int w = (int)strlen(s) * 36;
+        text((W - w) / 2, 52, s, 6, WHITE);
+        text(W / 2 - 12, 104, "LM", 2, GREY);
+    } else {
+        text(20, 70, stale ? "TESTER STOPPED SENDING" : "WAITING FOR DATA", 2, YELLOW);
+    }
+    draw_btn_note();
+    textf(6, 160, 1, GREY, "FW %s", FW_VERSION);
+    diag_on = true;
+    draw_diag();
+    present();
+}
+
+// Runs while a TKLamp tester is attached; returns when it is unplugged.
+static void tk_session() {
+    meter_kind = 2;
+    adv_set_attached(3);
+    strncpy(device_id, "TKLAMP", sizeof device_id);
+    have_result = false;
+    ble_scan_req = false;
+    ble_status(0, 0, 0);
+    ui_tk(0, false, false);
+    float hist[5] = {0};
+    int nh = 0, hi = 0;
+    int64_t last_rx = esp_timer_get_time(), last_draw = 0;
+    bool stale = false, drew_stale = false;
+    while (!usb_lost) {
+        int64_t v = tk_next(100);
+        int64_t now = esp_timer_get_time();
+        if (v >= 0) {
+            last_rx = now;
+            stale = false;
+            uint8_t pk[9] = {0x06};
+            uint32_t ms = (uint32_t)(now / 1000), raw = (uint32_t)v;
+            memcpy(pk + 1, &ms, 4);      // little-endian on the ESP32-S3
+            memcpy(pk + 5, &raw, 4);
+            ble_notify(res_handle, res_sub, pk, sizeof pk);
+            hist[hi] = raw / TK_RAW_PER_LM;
+            hi = (hi + 1) % 5;
+            if (nh < 5) nh++;
+            if (now - last_draw > 300000) {   // about 3 screen updates a second, on a 5-reading (about 1 s) average
+                float s = 0;
+                for (int i = 0; i < nh; i++) s += hist[i];
+                ui_tk(s / nh, true, false);
+                last_draw = now;
+                drew_stale = false;
+            }
+        } else if (now - last_rx > 5000000) {
+            stale = true;
+            if (!drew_stale) { ui_tk(0, false, true); drew_stale = true; }
+        }
+        ble_scan_req = false;       // no scan command on this instrument
+        ble_resend_req = false;
+        flip_tick();
+        btn_tick();
+        battery_tick();
+        link_tick();
+    }
+    meter_kind = 0;
+    device_id[0] = 0;
+    have_result = false;
+}
+
 // -------------------------------------------------------------- main ----
 extern "C" void app_main() {
     gpio_config_t bi = {};
@@ -1975,6 +2110,13 @@ extern "C" void app_main() {
                 usb_connected = true;
                 adv_set_attached(1);
                 ESP_LOGI(TAG, "connected: %s  %d-%d nm", device_id, range_lo, range_hi);
+            } else if (vcp && tk_probe()) {
+                // Not a Torch Bearer (it did not answer), but a TKLamp tester is streaming. It is only named once sure.
+                tk_session();           // TKLamp tester: streams on its own, no commands to send
+                vcp.reset();
+                adv_set_attached(0);
+                ui_waiting();
+                ble_status(3, 0, 0);
             } else {
                 vcp.reset();
                 if (ble_scan_req) { ble_scan_req = false; ble_status(3, 0, 0); }
