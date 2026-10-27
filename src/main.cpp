@@ -1186,8 +1186,9 @@ static void ui_waiting() {
     hdr_generic = true;
     header("NO USB", RED);
     hdr_generic = false;
-    text(20, 70, "PLUG IN SPECTROMETER", 2, YELLOW);
-    text(20, 100, "VIA OTG CABLE", 2, GREY);
+    text(20, 48, "PLUG IN AN INSTRUMENT", 2, YELLOW);
+    text(20, 74, "TORCH BEARER, COLORMUNKI", 2, GREY);
+    text(20, 94, "OR TKLAMP, VIA OTG CABLE", 2, GREY);
     waiting_shown = true;
     draw_btn_note();
     textf(6, 160, 1, GREY, "FW %s", FW_VERSION);
