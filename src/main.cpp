@@ -1989,8 +1989,8 @@ static int64_t tk_next(int wait_ms) {
     }
 }
 
-/** After a CH340 opened: is this the TKLamp tester? Listens at 9600 baud for a valid frame. Leaves the port at 115200 on
- *  a miss, so the Torch Bearer probe that follows works as before. */
+/** After a CH340 opened and did not answer as a Torch Bearer: is it the TKLamp tester? Listens at 9600 baud for a valid
+ *  frame. Leaves the port at 115200 on a miss, so the next attempt starts from the usual state. */
 static bool tk_probe() {
     usb_set_baud(9600);
     xStreamBufferReset(rx_stream);
@@ -2106,16 +2106,17 @@ extern "C" void app_main() {
                 adv_set_attached(0);
                 ui_waiting();
                 ble_status(3, 0, 0);
-            } else if (usb_try_open() && tk_probe()) {
+            } else if (usb_try_open() && tb_init()) {
+                usb_connected = true;
+                adv_set_attached(1);
+                ESP_LOGI(TAG, "connected: %s  %d-%d nm", device_id, range_lo, range_hi);
+            } else if (vcp && tk_probe()) {
+                // Not a Torch Bearer (it did not answer), but a TKLamp tester is streaming. It is only named once sure.
                 tk_session();           // TKLamp tester: streams on its own, no commands to send
                 vcp.reset();
                 adv_set_attached(0);
                 ui_waiting();
                 ble_status(3, 0, 0);
-            } else if (vcp && tb_init()) {
-                usb_connected = true;
-                adv_set_attached(1);
-                ESP_LOGI(TAG, "connected: %s  %d-%d nm", device_id, range_lo, range_hi);
             } else {
                 vcp.reset();
                 if (ble_scan_req) { ble_scan_req = false; ble_status(3, 0, 0); }
