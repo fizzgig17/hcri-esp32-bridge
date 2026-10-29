@@ -24,6 +24,8 @@
 #include "freertos/task.h"
 #include "freertos/stream_buffer.h"
 #include "driver/gpio.h"
+#include "driver/rtc_io.h"
+#include "esp_sleep.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
@@ -1364,7 +1366,74 @@ static void flip_tick() {
 }
 
 // Idle loops: when a watched pin goes low, log it and show it on the idle screens.
+// ------------------------------------------------------------- sleep ----
+// Hold either button for 2 seconds and the board goes to deep sleep; a press of a wake button starts it again (it reboots,
+// so Bluetooth and the instrument reconnect, a few seconds). Wake buttons: both side buttons on the Pro; on the plain S3
+// only the GPIO 14 one (BOOT, GPIO 0, doubles as the flashing-mode strap, so it is not used to wake it).
+#define SLEEP_HOLD_US 2000000
+static bool button_pressed();   // defined below
+static void deep_sleep_now() {
+    ESP_LOGI(TAG, "deep sleep");
+    clear();
+    text(88, 70, "SLEEPING", 3, WHITE);
+    text(40, 110, "PRESS A BUTTON TO WAKE", 1, GREY);
+    present();
+    vTaskDelay(pdMS_TO_TICKS(700));
+#ifdef BOARD_PRO
+    {   // the OTG boost powers the instrument from the battery: cut it, or the battery keeps draining
+        uint8_t r03;
+        if (pmu_read(0x03, &r03)) pmu_write(0x03, (uint8_t)((r03 & ~0x20) | 0x10));
+    }
+    const uint64_t wake_mask = (1ULL << PIN_BTN_A) | (1ULL << PIN_BTN_B);
+#else
+    const uint64_t wake_mask = (1ULL << PIN_BTN_B);
+#endif
+    gpio_set_level((gpio_num_t)PIN_LCD_BL, 0);
+    gpio_hold_en((gpio_num_t)PIN_LCD_BL);
+#ifndef BOARD_PRO
+    gpio_set_level((gpio_num_t)PIN_POWER_ON, 0);
+    gpio_hold_en((gpio_num_t)PIN_POWER_ON);
+#endif
+    gpio_deep_sleep_hold_en();
+    // The wake buttons are active low: keep their pull-ups on in the RTC domain, then wait for them to be let go,
+    // or the sleep would end straight away.
+    for (int pin = 0; pin < 22; pin++) {
+        if (!(wake_mask & (1ULL << pin))) continue;
+        rtc_gpio_init((gpio_num_t)pin);
+        rtc_gpio_set_direction((gpio_num_t)pin, RTC_GPIO_MODE_INPUT_ONLY);
+        rtc_gpio_pulldown_dis((gpio_num_t)pin);
+        rtc_gpio_pullup_en((gpio_num_t)pin);
+    }
+    esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
+    while (button_pressed()) vTaskDelay(pdMS_TO_TICKS(20));
+    vTaskDelay(pdMS_TO_TICKS(100));
+    if (esp_sleep_enable_ext1_wakeup(wake_mask, ESP_EXT1_WAKEUP_ANY_LOW) != ESP_OK) {
+        // Fall back to one pin if the chip does not take "any low" on several.
+        for (int pin = 0; pin < 22; pin++)
+            if (wake_mask & (1ULL << pin)) { esp_sleep_enable_ext0_wakeup((gpio_num_t)pin, 0); break; }
+    }
+    esp_deep_sleep_start();
+}
+// A press that is let go within 2 s is a normal press (returns true); one held that long puts the board to sleep (no return).
+static bool btn_short_press() {
+    int64_t t0 = esp_timer_get_time();
+    while (button_pressed()) {
+        if (esp_timer_get_time() - t0 > SLEEP_HOLD_US) deep_sleep_now();
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    return true;
+}
+// For the loops that do not act on a button press: sleep after a 2 s hold.
+static int64_t btn_hold_start_us = 0;
+static void btn_hold_tick() {
+    if (!button_pressed()) { btn_hold_start_us = 0; return; }
+    int64_t now = esp_timer_get_time();
+    if (!btn_hold_start_us) btn_hold_start_us = now;
+    else if (now - btn_hold_start_us > SLEEP_HOLD_US) deep_sleep_now();
+}
+
 static void btn_tick() {
+    btn_hold_tick();
     uint32_t m = button_mask();
     if (m == btn_seen) return;
     btn_seen = m;
@@ -1977,7 +2046,7 @@ static void mk_session() {
         else if (button_pressed()) {
             vTaskDelay(pdMS_TO_TICKS(30));
             trigger = from_button = button_pressed();
-            if (trigger) { btn_seen = button_mask(); btn_note(btn_seen); }
+            if (trigger) { btn_seen = button_mask(); btn_note(btn_seen); btn_short_press(); }   // held 2 s: deep sleep
         }
         bt_prev = bt;
         if (ble_resend_req) { ble_resend_req = false; ble_send_result(); }
@@ -2153,6 +2222,15 @@ static void tk_session() {
 
 // -------------------------------------------------------------- main ----
 extern "C" void app_main() {
+    // Coming back from deep sleep: the pins held during the sleep (backlight, power enable) and the button pins the RTC
+    // domain was watching go back to normal use.
+    gpio_deep_sleep_hold_dis();
+    gpio_hold_dis((gpio_num_t)PIN_LCD_BL);
+#ifndef BOARD_PRO
+    gpio_hold_dis((gpio_num_t)PIN_POWER_ON);
+#endif
+    rtc_gpio_deinit((gpio_num_t)PIN_BTN_A);
+    rtc_gpio_deinit((gpio_num_t)PIN_BTN_B);
     gpio_config_t bi = {};
     bi.mode = GPIO_MODE_INPUT;
     bi.pull_up_en = GPIO_PULLUP_ENABLE;
@@ -2210,6 +2288,7 @@ extern "C" void app_main() {
             } else if (button_pressed()) {
                 vTaskDelay(pdMS_TO_TICKS(30));  // debounce
                 bool top = btn_top_pressed(), bottom = btn_bottom_pressed();
+                if (top || bottom) btn_short_press();   // held 2 s: deep sleep; otherwise the action starts when it is let go
                 if (top || bottom) {
                     from_button = true;
                     btn_seen = button_mask(); btn_note(btn_seen);
