@@ -102,7 +102,7 @@ downloads the right firmware (checksum-verified) and flashes it.
 
 ## Bluetooth (BLE) trigger
 Advertises as "hCRI Bridge" (firmware before October 14, 2026 advertised "Torch Bearer"; the app accepts both). Service 7a1c0001-5b2e-4f0a-9c3d-2e8f6b4a1d00:
-- 7a1c0002-... command (write): 01 = scan now, 02 = resend last result
+- 7a1c0002-... command (write): 01 = scan now, 02 = resend last result, 06 = live (Torch Bearer only: keep scanning and send every locked result until 05), 05 = cancel the reading in progress or stop live
 - 7a1c0003-... result (notify/read): summary packet, then the full spectrum in chunks
 - 7a1c0004-... status (notify/read): [state u8][try u8][exposure_ms f32]; state 0 ready, 1 scanning, 2 done, 3 error, 4 done-not-locked
 
