@@ -771,9 +771,62 @@ static bool tb_scan(progress_fn progress, int timeout_s) {
     return ok;
 }
 
+// Live (continuous) mode: the Torch Bearer streams spectra for as long as it is not told to stop (tobes-ui does the same:
+// one GET_DATA, then read frames until STOP). Every frame that is locked (status 0) goes to `emit`, which applies the
+// correction and sends it to the phone. Frames that arrive faster than the phone can take them are dropped (only the newest
+// is sent). Ends on a cancel from the phone (command 05), a button press (stop_req), the cable being pulled, or 15 s without
+// a frame. Returns the number of frames sent.
+typedef bool (*stop_fn)();
+typedef void (*emit_fn)();
+static bool scan_cancelled();   // defined with the BLE state below
+static int tb_live(progress_fn progress, emit_fn emit, stop_fn stop_req) {
+    static uint8_t pl[1600];
+    uint8_t type;
+    acc_n = 0;
+    xStreamBufferReset(rx_stream);
+    if (!send_frame(T_DATA)) return 0;
+
+    int sent = 0, tries = 0;
+    bool last_ok = false;
+    int64_t last_frame_us = esp_timer_get_time();
+    while (!usb_lost && !scan_cancelled() && !(stop_req && stop_req())) {
+        int n = read_frame(&type, pl, sizeof pl, 200);
+        if (n < 0) {
+            if (esp_timer_get_time() - last_frame_us > 15000000) break;   // the spectrometer went quiet
+            continue;
+        }
+        if (type == T_STOP) { send_frame(T_DATA); continue; }             // same quirk as tb_scan / tobes-ui
+        if (type != T_DATA || n < 19) continue;
+        last_frame_us = esp_timer_get_time();
+        // Frames that queued up while the previous one was being sent: keep only the newest.
+        int m;
+        while ((m = read_frame(&type, pl, sizeof pl, 0)) >= 0) {
+            if (type == T_STOP) { send_frame(T_DATA); continue; }
+            if (type != T_DATA || m < 19) continue;
+            n = m;
+        }
+        decode(pl, n, scan);
+        scan.start_nm = range_lo;
+        tries++;
+        last_ok = scan.status == 0;
+        if (progress) progress(tries, scan.exposure_ms, scan.status);
+        if (last_ok) { emit(); sent++; }
+    }
+    send_frame(T_STOP);
+    if (last_ok) {   // a STOP ack follows a good frame; drain until we see it (frames still in flight are skipped)
+        int64_t until = esp_timer_get_time() + 1500000;
+        while (esp_timer_get_time() < until) {
+            int n = read_frame(&type, pl, sizeof pl, 300);
+            if (n >= 0 && type == T_STOP) break;
+        }
+    }
+    return sent;
+}
+
 // ------------------------------------------------------------- BLE ----
 // GATT service 7a1c0001-5b2e-4f0a-9c3d-2e8f6b4a1d00 ("Torch Bearer"):
-//   0002 command  (write)  : 01 = scan now, 02 = resend last result, 05 = cancel the reading in progress (ColorMunki:
+//   0002 command  (write)  : 01 = scan now, 02 = resend last result, 06 = live: keep scanning and send every locked result
+//                            until 05 (Torch Bearer only; each result is a normal summary + header + data + end), 05 = cancel the reading in progress (ColorMunki:
 //                            stops at its next step and goes back to ready without sending a result)
 //   0003 result   (notify/read): summary packet, then the full spectrum in chunks
 //   0004 status   (notify/read): [state u8][try u8][exposure_ms f32]
@@ -800,6 +853,7 @@ static bool res_sub = false, sta_sub = false;
 static uint8_t own_addr_type;
 static volatile bool ble_scan_req = false;
 static volatile bool ble_resend_req = false;
+static volatile bool ble_live_req = false;   // command 06: keep scanning until cancelled (05)
 // Cancel (command 05) applies to a reading only if it arrived after that reading was requested, so a late cancel
 // can never swallow the next reading.
 static volatile int64_t ble_scan_req_us = 0, ble_cancel_us = 0;
@@ -1010,6 +1064,7 @@ static int ble_access_cb(uint16_t, uint16_t, struct ble_gatt_access_ctxt *ctxt, 
             if (cmd == 0x01) { ble_scan_req_us = esp_timer_get_time(); ble_scan_req = true; }
             if (cmd == 0x05) ble_cancel_us = esp_timer_get_time();   // cancel the reading in progress (ColorMunki)
             if (cmd == 0x02) ble_resend_req = true;
+            if (cmd == 0x06) { ble_scan_req_us = esp_timer_get_time(); ble_live_req = true; }   // live (continuous) scanning, Torch Bearer only; 05 stops it
             if (cmd == 0x03) {  // 0x03 <0|1>: display orientation, 1 = turned 180 degrees
                 uint8_t v = 0;
                 if (OS_MBUF_PKTLEN(ctxt->om) >= 2 && os_mbuf_copydata(ctxt->om, 1, 1, &v) == 0) flip_req = v ? 1 : 0;
@@ -1947,6 +2002,15 @@ static void mk_session() {
     have_result = false;
 }
 
+static void tb_live_emit() {
+    if (scan.npts > 0) apply_correction(scan.spd, scan.npts, scan.start_nm);   // HPCS-fitted, before display + BLE
+    have_result = true;
+    ble_status(2, 0, scan.exposure_ms);
+    ble_send_result();
+    ble_status(1, 0, 0);   // still going: the phone sees state 2 (a result), then 1 again
+}
+static bool tb_live_stop() { return button_pressed(); }
+
 // ----------------------------------------------------- TKLamp tester ----
 // The TKLamp TK2303D integrating-sphere tester (CH340 serial, 9600 8N1) streams one 15-byte frame about every 220 ms while
 // it is plugged in, without being asked:
@@ -2143,6 +2207,21 @@ extern "C" void app_main() {
             if (ble_resend_req) {
                 ble_resend_req = false;
                 ble_send_result();
+            }
+            if (ble_live_req) {
+                ble_live_req = false;
+                ble_scan_req = false;
+                scan_started_us = ble_scan_req_us;
+                ui_scanning();
+                ble_status(1, 0, 0);
+                int n = tb_live(ui_progress, tb_live_emit, tb_live_stop);
+                if (usb_lost) break;
+                ESP_LOGI(TAG, "live ended after %d results", n);
+                have_result = scan.npts > 0;
+                ui_result(n > 0);
+                ble_status(n > 0 ? 0 : 4, 0, scan.exposure_ms);
+                while (tb_live_stop()) vTaskDelay(pdMS_TO_TICKS(20));   // a stopping button press must not start a scan
+                ble_scan_req = false;
             }
             if (trigger) {
                 ble_scan_req = false;
