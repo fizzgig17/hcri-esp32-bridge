@@ -1260,8 +1260,8 @@ static void ui_ready() {
     header("READY", GREEN);
     text(6, 32, device_id, 1, GREY);
     textf(6, 48, 1, GREY, "RANGE %d-%d NM", range_lo, range_hi);
-    text(20, 78, "TOP BUTTON: LIVE", 2, WHITE);       // roles follow the screen: see btn_top_pressed()
-    text(20, 100, "BOTTOM BUTTON: SCAN", 2, WHITE);
+    text(20, 78, "LIVE", 2, WHITE);       // top button; roles follow the screen: see btn_top_pressed()
+    text(20, 100, "SCAN", 2, WHITE);      // bottom button
     draw_btn_note();
     draw_btn_arrow();
     textf(arrow_bottom_left() ? 18 : 6, 160, 1, GREY, "FW %s", FW_VERSION);
