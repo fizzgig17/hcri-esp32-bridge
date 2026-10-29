@@ -1260,8 +1260,8 @@ static void ui_ready() {
     header("READY", GREEN);
     text(6, 32, device_id, 1, GREY);
     textf(6, 48, 1, GREY, "RANGE %d-%d NM", range_lo, range_hi);
-    text(20, 84, "PRESS BUTTON", 2, WHITE);
-    text(20, 104, "TO SCAN", 2, WHITE);
+    text(20, 78, "LIVE", 2, WHITE);       // top button; roles follow the screen: see btn_top_pressed()
+    text(20, 100, "SCAN", 2, WHITE);      // bottom button
     draw_btn_note();
     draw_btn_arrow();
     textf(arrow_bottom_left() ? 18 : 6, 160, 1, GREY, "FW %s", FW_VERSION);
@@ -1379,6 +1379,14 @@ static void btn_tick() {
 static bool button_pressed() {
     return gpio_get_level((gpio_num_t)PIN_BTN_A) == 0 || gpio_get_level((gpio_num_t)PIN_BTN_B) == 0;
 }
+
+// Torch Bearer button roles, as seen on the screen: the TOP button starts Live, the BOTTOM button takes one scan. The two
+// buttons are fixed pins, so the roles swap when the display is flipped (the screen turns 180 degrees, the buttons do not).
+// Unflipped, A is the top one (the Pro's comments above: A = top press, B = bottom press). If a board's labels turn out the
+// wrong way round, swap A and B here -- this is the only place that decides it.
+static inline bool btn_pin_low(int pin) { return gpio_get_level((gpio_num_t)pin) == 0; }
+static bool btn_top_pressed() { return btn_pin_low(flipped ? PIN_BTN_B : PIN_BTN_A); }
+static bool btn_bottom_pressed() { return btn_pin_low(flipped ? PIN_BTN_A : PIN_BTN_B); }
 
 #ifdef COLORMUNKI_PROBE
 // ------------------------------------------------------- ColorMunki probe ----
@@ -2196,22 +2204,33 @@ extern "C" void app_main() {
 
         // 2. scan on button press or BLE command until the cable is pulled
         while (usb_connected && !usb_lost) {
-            bool trigger = false, from_button = false;
+            bool trigger = false, from_button = false, live_from_button = false;
             if (ble_scan_req) {
                 trigger = true;
             } else if (button_pressed()) {
                 vTaskDelay(pdMS_TO_TICKS(30));  // debounce
-                trigger = from_button = button_pressed();
-                if (trigger) { btn_seen = button_mask(); btn_note(btn_seen); }
+                bool top = btn_top_pressed(), bottom = btn_bottom_pressed();
+                if (top || bottom) {
+                    from_button = true;
+                    btn_seen = button_mask(); btn_note(btn_seen);
+                    if (top && !bottom) live_from_button = true;   // top button: Live
+                    else trigger = true;                           // bottom button (or both): one scan
+                }
             }
             if (ble_resend_req) {
                 ble_resend_req = false;
                 ble_send_result();
             }
-            if (ble_live_req) {
+            if (ble_live_req || live_from_button) {
+                // From the phone (06) the reading counts from its request; from the top button, from the moment it is let go.
+                if (live_from_button) {
+                    while (button_pressed()) vTaskDelay(pdMS_TO_TICKS(20));   // the press that starts Live must not also stop it
+                    scan_started_us = esp_timer_get_time();
+                } else {
+                    scan_started_us = ble_scan_req_us;
+                }
                 ble_live_req = false;
                 ble_scan_req = false;
-                scan_started_us = ble_scan_req_us;
                 ui_scanning();
                 ble_status(1, 0, 0);
                 int n = tb_live(ui_progress, tb_live_emit, tb_live_stop);
