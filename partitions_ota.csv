@@ -1,0 +1,10 @@
+# Name,   Type, SubType, Offset,   Size,     Flags
+# Two app slots, so the phone can send a new firmware over Bluetooth into the one that is not running (see "Firmware update"
+# in src/main.cpp). The first four lines keep the standard ESP-IDF "two OTA" positions; the app still starts at 0x10000, so the
+# factory image (bootloader 0x0, partition table 0x8000, app 0x10000) is merged exactly as before. Each slot is 1.5 MB; the
+# firmware is about 0.7 MB. The 16 MB flash has the rest to spare.
+nvs,      data, nvs,     0x9000,   0x4000,
+otadata,  data, ota,     0xd000,   0x2000,
+phy_init, data, phy,     0xf000,   0x1000,
+ota_0,    app,  ota_0,   0x10000,  0x180000,
+ota_1,    app,  ota_1,   0x190000, 0x180000,

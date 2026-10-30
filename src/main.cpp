@@ -43,6 +43,9 @@
 #include "usb/vcp.hpp"
 
 #include "nvs_flash.h"
+#include "esp_ota_ops.h"
+#include "esp_system.h"
+#include "mbedtls/sha256.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
@@ -63,6 +66,12 @@ static const char *TAG = "tobes";
 #define FW_STR2(x) #x
 #define FW_STR(x) FW_STR2(x)
 static const char *FW_VERSION = FW_STR(FW_GIT);
+
+// True while the phone is sending a new firmware (BLE OTA, see "Firmware update" below). The idle-loop screen updates, the
+// buttons and the sleep timer stand still meanwhile, so nothing draws over the progress screen or puts the board to sleep.
+static volatile bool ota_active = false;
+static volatile bool ota_redraw = false;   // an update ended without a restart: put the normal screen back
+static volatile int64_t ota_redraw_at = 0; // ... but not before this time (esp_timer us), so a failure message can be read
 
 // ---------------------------------------------------------------- pins ----
 #ifdef BOARD_PRO
@@ -544,6 +553,7 @@ static void draw_diag() {
 
 // Called from the idle loops: refresh the indicator (at most every 5 s) and redraw if it changed.
 static void battery_tick() {
+    if (ota_active) return;
     static int64_t last = -5000000;
     int64_t now = esp_timer_get_time();
     if (now - last < 5000000) return;
@@ -832,6 +842,9 @@ static int tb_live(progress_fn progress, emit_fn emit, stop_fn stop_req) {
 //                            stops at its next step and goes back to ready without sending a result)
 //   0003 result   (notify/read): summary packet, then the full spectrum in chunks
 //   0004 status   (notify/read): [state u8][try u8][exposure_ms f32]
+//   0005 update   (write, write-no-response, notify, read): firmware update over Bluetooth, see "Firmware update" below
+//   0006 info     (read): [proto u8 = 1][flags u8: bit0 = can update over Bluetooth][board u8: 0 T-Display S3, 1 S3 Pro]
+//                         [running slot u8: 0 or 1][reserved u8] then the firmware's git commit as text (not zero-ended)
 //        state: 0 ready, 1 scanning, 2 done, 3 error (no USB / timeout), 4 done but not locked
 // Packets (all little-endian):
 //   summary  : 01 | status u8 | peak_nm u16 | exposure_ms f32 | peak_val f32 | sum f32 | npts u16 | start_nm u16
@@ -847,6 +860,8 @@ static const ble_uuid128_t SVC_UUID = BLE_UUID128_INIT(0x00,0x1d,0x4a,0x6b,0x8f,
 static const ble_uuid128_t CMD_UUID = BLE_UUID128_INIT(0x00,0x1d,0x4a,0x6b,0x8f,0x2e,0x3d,0x9c,0x0a,0x4f,0x2e,0x5b,0x02,0x00,0x1c,0x7a);
 static const ble_uuid128_t RES_UUID = BLE_UUID128_INIT(0x00,0x1d,0x4a,0x6b,0x8f,0x2e,0x3d,0x9c,0x0a,0x4f,0x2e,0x5b,0x03,0x00,0x1c,0x7a);
 static const ble_uuid128_t STA_UUID = BLE_UUID128_INIT(0x00,0x1d,0x4a,0x6b,0x8f,0x2e,0x3d,0x9c,0x0a,0x4f,0x2e,0x5b,0x04,0x00,0x1c,0x7a);
+static const ble_uuid128_t OTA_UUID = BLE_UUID128_INIT(0x00,0x1d,0x4a,0x6b,0x8f,0x2e,0x3d,0x9c,0x0a,0x4f,0x2e,0x5b,0x05,0x00,0x1c,0x7a);
+static const ble_uuid128_t INF_UUID = BLE_UUID128_INIT(0x00,0x1d,0x4a,0x6b,0x8f,0x2e,0x3d,0x9c,0x0a,0x4f,0x2e,0x5b,0x06,0x00,0x1c,0x7a);
 
 static uint16_t ble_conn = BLE_HS_CONN_HANDLE_NONE;
 static volatile uint32_t ble_conn_count = 0;   // counts connections, so "once per connection" survives reused handles
@@ -990,6 +1005,9 @@ static void ble_send_blob(uint8_t id, const uint8_t *d, size_t n) {
 }
 
 static int ble_gap_cb(struct ble_gap_event *ev, void *);
+static uint16_t ota_handle = 0;   // characteristic 0005 (firmware update): see "Firmware update" below
+static bool ota_sub = false;
+static void ota_abort_quiet();
 // What is plugged into the bridge, sent in the advertisement so the app can show it (and hide an empty bridge) in its
 // device list without connecting: 0 nothing, 1 Torch Bearer, 2 ColorMunki, 3 TKLamp tester. Manufacturer data = company id 0xFFFF
 // (reserved for testing), then 'h' 'C' and this byte. Old apps ignore it; old firmware simply doesn't send it.
@@ -1042,7 +1060,8 @@ static int ble_gap_cb(struct ble_gap_event *ev, void *) {
         break;
     case BLE_GAP_EVENT_DISCONNECT:
         ble_conn = BLE_HS_CONN_HANDLE_NONE;
-        res_sub = sta_sub = false;
+        res_sub = sta_sub = ota_sub = false;
+        if (ota_active) { ota_abort_quiet(); ESP_LOGW(TAG, "update cancelled: phone disconnected"); }
         ble_advertise();
         break;
     case BLE_GAP_EVENT_ADV_COMPLETE:
@@ -1051,6 +1070,7 @@ static int ble_gap_cb(struct ble_gap_event *ev, void *) {
     case BLE_GAP_EVENT_SUBSCRIBE:
         if (ev->subscribe.attr_handle == res_handle) res_sub = ev->subscribe.cur_notify;
         if (ev->subscribe.attr_handle == sta_handle) sta_sub = ev->subscribe.cur_notify;
+        if (ev->subscribe.attr_handle == ota_handle) ota_sub = ev->subscribe.cur_notify;
         break;
     default:
         break;
@@ -1058,11 +1078,202 @@ static int ble_gap_cb(struct ble_gap_event *ev, void *) {
     return 0;
 }
 
+
+// ------------------------------------------------------- firmware update ----
+// Over-the-air update from the phone, on characteristic 0005. The image goes into the spare app slot (ota_0/ota_1, see
+// partitions_ota.csv), is checked against a SHA-256 the phone sends first, and is only then made the boot slot. The new
+// firmware must start and run for OTA_VALID_AFTER_S seconds; if it crashes or resets before that, the bootloader goes back to
+// the old slot by itself (rollback), so a bad image can't leave the board unusable.
+//   phone -> board (first byte = op):
+//     01 begin : 01 | size u32 | sha256 [32] | board u8   (board: 0 S3, 1 Pro; refused if it is the other one)
+//     02 data  : 02 | offset u32 | bytes...                (offset must be exactly the number of bytes taken so far)
+//     03 end   : 03                                         (checks size and SHA-256, switches slot, restarts after ~1.5 s)
+//     04 abort : 04
+//   board -> phone (notify, and readable as the last one sent; all little-endian):
+//     81 | slot u8            begin accepted (slot = the slot being written)
+//     82 | received u32       progress, about every 4 KB
+//     83                      done: the board restarts into the new firmware
+//     E1 | expected u32       an offset did not match: send again from `expected`
+//     E0 | code u8            failed: 1 begin refused (size, wrong board, no spare slot), 2 flash write failed,
+//                             3 not started, 4 size mismatch, 5 SHA-256 mismatch, 6 image rejected / slot switch failed
+#define OTA_VALID_AFTER_S 10
+static uint8_t ota_last[8] = {0xE0, 3};
+static size_t ota_last_len = 2;
+static esp_ota_handle_t ota_h = 0;
+static const esp_partition_t *ota_part = NULL;
+static uint32_t ota_total = 0, ota_got = 0, ota_acked = 0;
+static uint8_t ota_sha_want[32];
+static mbedtls_sha256_context ota_sha;
+static bool ota_ctx_ready = false;
+static void ota_draw(int pct, const char *msg, bool bad);
+
+static void ota_send(const uint8_t *d, size_t n) {
+    memcpy(ota_last, d, n);
+    ota_last_len = n;
+    if (ble_conn == BLE_HS_CONN_HANDLE_NONE || !ota_sub) return;
+    // One try, no waiting: this runs in the Bluetooth host task, which must not sit and wait for itself. If a notification is
+    // lost the phone reads the characteristic, or sends again after its own timeout.
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(d, n);
+    if (om) ble_gatts_notify_custom(ble_conn, ota_handle, om);
+}
+static void ota_fail(uint8_t code, const char *detail = nullptr) {
+    uint8_t m[2] = {0xE0, code};
+    ota_send(m, 2);
+    if (ota_h) { esp_ota_abort(ota_h); ota_h = 0; }
+    if (ota_ctx_ready) { mbedtls_sha256_free(&ota_sha); ota_ctx_ready = false; }
+    ESP_LOGW(TAG, "update failed (%d)", code);
+    ota_draw(0, detail ? detail : "UPDATE FAILED", true);
+    ota_active = false;
+    ota_redraw_at = esp_timer_get_time() + 5000000;
+    ota_redraw = true;   // the idle loop puts the normal screen back after 5 s
+}
+// SHA-256 of what is actually stored in the new slot (read back from flash, 1 KB at a time). This is the truth about the update.
+static bool ota_flash_hash(uint8_t out[32]) {
+    if (!ota_part) return false;
+    static uint8_t blk[1024];
+    mbedtls_sha256_context c;
+    mbedtls_sha256_init(&c);
+    mbedtls_sha256_starts(&c, 0);
+    for (uint32_t off = 0; off < ota_total; off += sizeof blk) {
+        size_t n = ota_total - off < sizeof blk ? ota_total - off : sizeof blk;
+        if (esp_partition_read(ota_part, off, blk, n) != ESP_OK) { mbedtls_sha256_free(&c); return false; }
+        mbedtls_sha256_update(&c, blk, n);
+    }
+    mbedtls_sha256_finish(&c, out);
+    mbedtls_sha256_free(&c);
+    return true;
+}
+static void ota_abort_quiet() {   // the phone went away or asked to stop
+    if (!ota_active) return;
+    if (ota_h) { esp_ota_abort(ota_h); ota_h = 0; }
+    if (ota_ctx_ready) { mbedtls_sha256_free(&ota_sha); ota_ctx_ready = false; }
+    ota_active = false;
+    ota_redraw_at = 0;
+    ota_redraw = true;
+}
+static void ota_restart_cb(void *) { esp_restart(); }
+
+static void ota_handle_write(const uint8_t *d, size_t n) {
+    if (n < 1) return;
+    switch (d[0]) {
+    case 0x01: {   // begin
+        if (n < 38) { ota_fail(1); return; }
+        if (ota_active) ota_abort_quiet();
+        uint32_t size;
+        memcpy(&size, d + 1, 4);
+        uint8_t board = d[37];
+#ifdef BOARD_PRO
+        const uint8_t mine = 1;
+#else
+        const uint8_t mine = 0;
+#endif
+        ota_part = esp_ota_get_next_update_partition(NULL);
+        if (!ota_part || board != mine || size < 100000 || size > ota_part->size) { ota_fail(1); return; }
+        if (esp_ota_begin(ota_part, OTA_WITH_SEQUENTIAL_WRITES, &ota_h) != ESP_OK) { ota_h = 0; ota_fail(1); return; }
+        memcpy(ota_sha_want, d + 5, 32);
+        mbedtls_sha256_init(&ota_sha);
+        mbedtls_sha256_starts(&ota_sha, 0);
+        ota_ctx_ready = true;
+        ota_total = size;
+        ota_got = ota_acked = 0;
+        ota_active = true;
+        ota_draw(0, "UPDATING FIRMWARE", false);
+        uint8_t m[2] = {0x81, (uint8_t)(ota_part->subtype - ESP_PARTITION_SUBTYPE_APP_OTA_MIN)};
+        ota_send(m, 2);
+        ESP_LOGI(TAG, "update begins: %u bytes into %s", (unsigned)size, ota_part->label);
+        break;
+    }
+    case 0x02: {   // data
+        if (!ota_active || !ota_h) { uint8_t m[2] = {0xE0, 3}; ota_send(m, 2); return; }
+        if (n < 6) return;
+        uint32_t off;
+        memcpy(&off, d + 1, 4);
+        if (off != ota_got) {   // a chunk was lost or arrived twice: tell the phone where to continue
+            uint8_t m[5] = {0xE1};
+            memcpy(m + 1, &ota_got, 4);
+            ota_send(m, 5);
+            return;
+        }
+        size_t len = n - 5;
+        if (ota_got + len > ota_total) { ota_fail(4); return; }
+        if (esp_ota_write(ota_h, d + 5, len) != ESP_OK) { ota_fail(2); return; }
+        mbedtls_sha256_update(&ota_sha, d + 5, len);
+        ota_got += len;
+        if (ota_got - ota_acked >= 4096 || ota_got == ota_total) {
+            ota_acked = ota_got;
+            uint8_t m[5] = {0x82};
+            memcpy(m + 1, &ota_got, 4);
+            ota_send(m, 5);
+            ota_draw((int)((uint64_t)ota_got * 100 / ota_total), "UPDATING FIRMWARE", false);
+        }
+        break;
+    }
+    case 0x03: {   // end
+        if (!ota_active || !ota_h) { uint8_t m[2] = {0xE0, 3}; ota_send(m, 2); return; }
+        if (ota_got != ota_total) { ota_fail(4); return; }
+        uint8_t got[32];
+        mbedtls_sha256_finish(&ota_sha, got);
+        mbedtls_sha256_free(&ota_sha);
+        ota_ctx_ready = false;
+        // The running hash of the bytes received and a fresh hash of what landed in flash. The flash is what will boot, so it decides;
+        // if they disagree, the screen shows the first bytes of each (S = stream, F = flash, W = wanted) so the cause can be found.
+        uint8_t fl[32] = {0};
+        bool fl_ok = ota_flash_hash(fl);
+        bool stream_ok = memcmp(got, ota_sha_want, 32) == 0;
+        bool flash_ok = fl_ok && memcmp(fl, ota_sha_want, 32) == 0;
+        if (!flash_ok) {
+            char msg[40];
+            snprintf(msg, sizeof msg, "S%02X%02X F%02X%02X W%02X%02X", got[0], got[1], fl[0], fl[1], ota_sha_want[0], ota_sha_want[1]);
+            ESP_LOGW(TAG, "update hash mismatch: %s (flash read %s)", msg, fl_ok ? "ok" : "failed");
+            ota_fail(5, msg);
+            return;
+        }
+        if (!stream_ok) ESP_LOGW(TAG, "running hash differed but the flash copy is correct; accepting");
+        esp_err_t e = esp_ota_end(ota_h);
+        ota_h = 0;
+        if (e != ESP_OK || esp_ota_set_boot_partition(ota_part) != ESP_OK) { ota_fail(6); return; }
+        uint8_t m[1] = {0x83};
+        ota_send(m, 1);
+        ota_draw(100, "UPDATED - RESTARTING", false);
+        ESP_LOGI(TAG, "update done, restarting");
+        static esp_timer_handle_t t;
+        esp_timer_create_args_t a = {};
+        a.callback = ota_restart_cb;
+        a.name = "ota_restart";
+        if (esp_timer_create(&a, &t) == ESP_OK) esp_timer_start_once(t, 1500000);
+        break;
+    }
+    case 0x04:   // abort
+        ota_abort_quiet();
+        break;
+    default:
+        break;
+    }
+}
+
+// Once the new firmware has run for OTA_VALID_AFTER_S seconds it is accepted for good; until then a reset puts the old one back.
+static void ota_valid_cb(void *) { esp_ota_mark_app_valid_cancel_rollback(); }
+static void ota_validate_later() {
+    static esp_timer_handle_t t;
+    esp_timer_create_args_t a = {};
+    a.callback = ota_valid_cb;
+    a.name = "ota_valid";
+    if (esp_timer_create(&a, &t) == ESP_OK) esp_timer_start_once(t, (uint64_t)OTA_VALID_AFTER_S * 1000000);
+}
+
 static int ble_access_cb(uint16_t, uint16_t, struct ble_gatt_access_ctxt *ctxt, void *arg) {
-    int which = (int)(intptr_t)arg;  // 0 command, 1 result, 2 status
+    int which = (int)(intptr_t)arg;  // 0 command, 1 result, 2 status, 3 firmware update, 4 info
+    if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR && which == 3) {
+        uint8_t buf[260];
+        uint16_t n = OS_MBUF_PKTLEN(ctxt->om);
+        if (n > sizeof buf) n = sizeof buf;
+        if (os_mbuf_copydata(ctxt->om, 0, n, buf) == 0) ota_handle_write(buf, n);
+        return 0;
+    }
     if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR && which == 0) {
         uint8_t cmd = 0;
         if (OS_MBUF_PKTLEN(ctxt->om) >= 1 && os_mbuf_copydata(ctxt->om, 0, 1, &cmd) == 0) {
+            if (ota_active) return 0;   // nothing starts while a firmware update is being received
             if (cmd == 0x01) { ble_scan_req_us = esp_timer_get_time(); ble_scan_req = true; }
             if (cmd == 0x05) ble_cancel_us = esp_timer_get_time();   // cancel the reading in progress (ColorMunki)
             if (cmd == 0x02) ble_resend_req = true;
@@ -1073,6 +1284,19 @@ static int ble_access_cb(uint16_t, uint16_t, struct ble_gatt_access_ctxt *ctxt, 
             }
         }
         return 0;
+    }
+    if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR && which == 3) return os_mbuf_append(ctxt->om, ota_last, ota_last_len) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+    if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR && which == 4) {
+        const esp_partition_t *run = esp_ota_get_running_partition();
+#ifdef BOARD_PRO
+        const uint8_t board = 1;
+#else
+        const uint8_t board = 0;
+#endif
+        uint8_t slot = (run && run->subtype >= ESP_PARTITION_SUBTYPE_APP_OTA_MIN) ? (uint8_t)(run->subtype - ESP_PARTITION_SUBTYPE_APP_OTA_MIN) : 0;
+        uint8_t h[5] = {1, 1, board, slot, 0};
+        if (os_mbuf_append(ctxt->om, h, sizeof h) != 0) return BLE_ATT_ERR_INSUFFICIENT_RES;
+        return os_mbuf_append(ctxt->om, FW_VERSION, strlen(FW_VERSION)) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
     }
     if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
         uint8_t b[32];
@@ -1088,7 +1312,7 @@ static int ble_access_cb(uint16_t, uint16_t, struct ble_gatt_access_ctxt *ctxt, 
     return BLE_ATT_ERR_UNLIKELY;
 }
 
-static struct ble_gatt_chr_def ble_chrs[4];
+static struct ble_gatt_chr_def ble_chrs[6];
 static struct ble_gatt_svc_def ble_svcs[2];
 
 static void ble_on_sync() {
@@ -1122,6 +1346,15 @@ static void ble_start() {
     ble_chrs[2].arg = (void *)2;
     ble_chrs[2].flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY;
     ble_chrs[2].val_handle = &sta_handle;
+    ble_chrs[3].uuid = &OTA_UUID.u;
+    ble_chrs[3].access_cb = ble_access_cb;
+    ble_chrs[3].arg = (void *)3;
+    ble_chrs[3].flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP | BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY;
+    ble_chrs[3].val_handle = &ota_handle;
+    ble_chrs[4].uuid = &INF_UUID.u;
+    ble_chrs[4].access_cb = ble_access_cb;
+    ble_chrs[4].arg = (void *)4;
+    ble_chrs[4].flags = BLE_GATT_CHR_F_READ;
     memset(ble_svcs, 0, sizeof ble_svcs);
     ble_svcs[0].type = BLE_GATT_SVC_TYPE_PRIMARY;
     ble_svcs[0].uuid = &SVC_UUID.u;
@@ -1157,7 +1390,10 @@ static void draw_app_link() {
     text(298, 45, "APP", 1, CYAN);
 }
 // Called from the idle loops: redraw only when the phone connects or disconnects.
+static void ota_restore_ui();
 static void link_tick() {
+    if (ota_redraw && esp_timer_get_time() >= ota_redraw_at) { ota_redraw = false; ota_restore_ui(); return; }
+    if (ota_active) return;
     if ((ble_conn != BLE_HS_CONN_HANDLE_NONE) == link_shown) return;
     draw_app_link();
     present();
@@ -1286,6 +1522,27 @@ static void ui_progress(int tries, float exp_ms, int status) {
 
 static void ui_scanning() { ui_progress(0, 0, 2); }
 
+// Firmware update screen (BLE OTA, see "Firmware update"): a progress bar while the phone sends the image.
+static void ota_draw(int pct, const char *msg, bool bad) {
+    diag_on = false;
+    clear();
+    header("UPDATE", bad ? RED : YELLOW);
+    text(10, 50, msg, 2, bad ? RED : WHITE);
+    if (!bad) {
+        const int bx = 10, by = 90, bw = W - 20, bh = 22;
+        fill(bx, by, bw, bh, GREY);
+        fill(bx + 2, by + 2, bw - 4, bh - 4, BLACK);
+        fill(bx + 2, by + 2, (bw - 4) * pct / 100, bh - 4, GREEN);
+        textf(10, 124, 2, WHITE, "%d%%", pct);
+        text(10, 150, "KEEP THE PHONE CLOSE", 1, GREY);
+    }
+    present();
+}
+// After a failed or cancelled update: the screen the board was on before.
+static void ota_restore_ui() {
+    if (usb_connected) ui_ready(); else ui_waiting();
+}
+
 static uint16_t wl_color(int nm) {   // rough wavelength to colour
     if (nm < 380 || nm > 750) return rgb(80, 80, 80);   // UV / IR: no visible colour, plot in grey
     double r = 0, g = 0, b = 0;
@@ -1352,6 +1609,7 @@ static void ui_result(bool ok) {
 
 // Apply an orientation asked for over BLE: turn the panel, remember it, and redraw the frame buffer the new way up.
 static void flip_tick() {
+    if (ota_active) return;
     int8_t r = flip_req;
     if (r < 0) return;
     flip_req = -1;
@@ -1433,6 +1691,7 @@ static void btn_hold_tick() {
 }
 
 static void btn_tick() {
+    if (ota_active) return;
     btn_hold_tick();
     uint32_t m = button_mask();
     if (m == btn_seen) return;
@@ -2247,6 +2506,7 @@ extern "C" void app_main() {
     mk_init();
     ble_start();
     ui_waiting();
+    ota_validate_later();   // after a Bluetooth update: keep this firmware once it has run a while (else the bootloader goes back)
 
     while (true) {
         // 1. wait for the spectrometer (or a ColorMunki)
@@ -2285,7 +2545,7 @@ extern "C" void app_main() {
             bool trigger = false, from_button = false, live_from_button = false;
             if (ble_scan_req) {
                 trigger = true;
-            } else if (button_pressed()) {
+            } else if (!ota_active && button_pressed()) {
                 vTaskDelay(pdMS_TO_TICKS(30));  // debounce
                 bool top = btn_top_pressed(), bottom = btn_bottom_pressed();
                 if (top || bottom) btn_short_press();   // held 2 s: deep sleep; otherwise the action starts when it is let go

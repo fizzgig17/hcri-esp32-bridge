@@ -75,6 +75,17 @@ downloads the right firmware (checksum-verified) and flashes it.
 - **Already up to date?** Before flashing it reads which build is on the board (commit and build time) and compares it
   with the download. If they are the same build it does nothing (it asks first, unless `--yes`). `--force` flashes anyway.
 
+### Updating from the phone (no cable)
+Once a board has the firmware with the two-slot layout (`partitions_ota.csv`), the hCRI Companion app can update it over
+Bluetooth: open the bridge's page in the app, tap **Update bridge firmware**, and keep the phone close until the board
+restarts (about a minute). The app downloads the right file for the board (`firmware.bin` for the S3,
+`firmware-pro.bin` for the Pro), checks its SHA-256 and sends it to the spare slot. If the new firmware resets before it has run
+for 10 seconds, the bootloader goes back to the old one by itself.
+
+**One-time step:** boards flashed before this need the full factory image flashed once over USB (the layout changed), exactly as
+under *Getting the firmware* above. After that, updates are wireless. (Saved settings, i.e. the screen flip, are reset by that
+one USB flash.)
+
 ## Flashing a downloaded build
 
 1. **Put the board in download mode** (needed any time the firmware is running -- it takes over
@@ -113,6 +124,11 @@ Result packets (little-endian):
 - 04 | chunks u8           (end marker)
 - 05 | id u8 | seq u8 | last u8 | bytes...   (ColorMunki diagnostics after the end marker: id 1 = the reading's raw
   sensor data, id 2 = the calibration block once per connection. Apps that don't know 05 ignore it.)
+
+- 7a1c0005-... update (write, write-no-response, notify, read): firmware update over Bluetooth. Write `01 | size u32 | sha256[32] | board u8`
+  (0 = S3, 1 = Pro), then `02 | offset u32 | bytes` in chunks, then `03`; `04` aborts. Notifications: `81 | slot`, `82 | received u32` (every ~4 KB),
+  `83` done (restarts), `E1 | expected u32` (send again from there), `E0 | code`. Details in `src/main.cpp`, "Firmware update".
+- 7a1c0006-... info (read): `[1][flags: bit0 = can update over Bluetooth][board: 0 S3, 1 Pro][running slot][0]` then the git commit as text.
 
 Test with nRF Connect: connect, subscribe to result + status, write 01 to the command characteristic.
 
