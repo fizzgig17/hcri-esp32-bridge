@@ -9,3 +9,7 @@ CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
 CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
 CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=247
 CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=24
+# Firmware update over Bluetooth: if the new firmware resets before it has run long enough, the bootloader goes back to the old one.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+# The update is written from the Bluetooth host task (flash write + SHA-256 + screen), so give it more stack.
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=8192

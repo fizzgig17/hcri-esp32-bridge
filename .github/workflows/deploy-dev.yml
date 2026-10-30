@@ -82,7 +82,9 @@ jobs:
             -o hcri-esp32-bridge-pro-factory.bin \
             --flash_mode keep --flash_freq keep --flash_size keep \
             0x0 bootloader.bin 0x8000 partitions.bin 0x10000 firmware.bin
-          sha256sum hcri-esp32-bridge-pro-factory.bin | tee SHA256SUMS-pro.txt
+          # The app alone, named for the Pro: this is what the phone sends over Bluetooth (firmware.bin is the S3's).
+          cp firmware.bin firmware-pro.bin
+          sha256sum hcri-esp32-bridge-pro-factory.bin firmware-pro.bin | tee SHA256SUMS-pro.txt
 
       - name: Move dev-latest tag to this commit
         run: |
@@ -109,4 +111,5 @@ jobs:
             .pio/build/tdisplay-s3/SHA256SUMS.txt
             tools/hcri_companion_esp32_bridge.py
             .pio/build/tdisplay-s3-pro/hcri-esp32-bridge-pro-factory.bin
+            .pio/build/tdisplay-s3-pro/firmware-pro.bin
             .pio/build/tdisplay-s3-pro/SHA256SUMS-pro.txt

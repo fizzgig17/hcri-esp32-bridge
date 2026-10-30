@@ -31,6 +31,7 @@ import hashlib
 import json
 import os
 import struct
+import zlib
 import subprocess
 import sys
 import tempfile
@@ -154,19 +155,50 @@ def image_app(path):
     return None, None
 
 
-def board_app(port, off):
-    """App description of what is on the board now, read from its flash at `off` (None if it can't be read)."""
+def read_board_flash(port, off, size):
+    """`size` bytes of the board's flash at `off`, or None if it can't be read."""
     dest = os.path.join(tempfile.gettempdir(), "hcri-bridge-installed.bin")
     try:
         os.remove(dest)
     except OSError:
         pass
     rc, _ = run_esptool(["--chip", "esp32s3", "--port", port, "--baud", "460800",
-                         "read_flash", hex(off), "0x200", dest], capture=True)
+                         "read_flash", hex(off), hex(size), dest], capture=True)
     if rc != 0 or not os.path.exists(dest):
         return None
     with open(dest, "rb") as f:
-        return app_desc(f.read())
+        return f.read()
+
+
+def board_app(port, off):
+    """App description of what is on the board now (None if it can't be read). `off` is the first app partition of the
+    layout the new image uses. A board that can be updated over Bluetooth has two app slots and runs the one its OTA data
+    names, so read the board's own partition table and pick the running slot; an older board has the one app at `off`."""
+    table = read_board_flash(port, 0x8000, 0xC00)
+    slots, otadata = [], None
+    for i in range(0, len(table or b""), 32):
+        e = table[i:i + 32]
+        if e[:2] != b"\xaa\x50":
+            break
+        ptype, sub = e[2], e[3]
+        poff = struct.unpack_from("<I", e, 4)[0]
+        if ptype == 0 and 0x10 <= sub <= 0x1F:        # app, OTA slot
+            slots.append((sub - 0x10, poff))
+        elif ptype == 1 and sub == 0:                 # data, ota (which slot is current)
+            otadata = poff
+    if len(slots) >= 2 and otadata is not None:
+        slots.sort()
+        seq = 0
+        sel = read_board_flash(port, otadata, 0x2000)
+        for k in (0, 0x1000):
+            if sel and len(sel) >= k + 32:
+                n, crc = struct.unpack_from("<I", sel, k)[0], struct.unpack_from("<I", sel, k + 28)[0]
+                if n != 0xFFFFFFFF and crc == (zlib.crc32(sel[k:k + 4]) & 0xFFFFFFFF) and n > seq:
+                    seq = n
+        slot = (seq - 1) % len(slots) if seq else 0   # no valid entry: the bootloader starts the first slot
+        off = slots[slot][1]
+    data = read_board_flash(port, off, 0x200)
+    return app_desc(data) if data else None
 
 
 def describe(a):
