@@ -1116,16 +1116,32 @@ static void ota_send(const uint8_t *d, size_t n) {
     struct os_mbuf *om = ble_hs_mbuf_from_flat(d, n);
     if (om) ble_gatts_notify_custom(ble_conn, ota_handle, om);
 }
-static void ota_fail(uint8_t code) {
+static void ota_fail(uint8_t code, const char *detail = nullptr) {
     uint8_t m[2] = {0xE0, code};
     ota_send(m, 2);
     if (ota_h) { esp_ota_abort(ota_h); ota_h = 0; }
     if (ota_ctx_ready) { mbedtls_sha256_free(&ota_sha); ota_ctx_ready = false; }
     ESP_LOGW(TAG, "update failed (%d)", code);
-    ota_draw(0, "UPDATE FAILED", true);
+    ota_draw(0, detail ? detail : "UPDATE FAILED", true);
     ota_active = false;
     ota_redraw_at = esp_timer_get_time() + 5000000;
     ota_redraw = true;   // the idle loop puts the normal screen back after 5 s
+}
+// SHA-256 of what is actually stored in the new slot (read back from flash, 1 KB at a time). This is the truth about the update.
+static bool ota_flash_hash(uint8_t out[32]) {
+    if (!ota_part) return false;
+    static uint8_t blk[1024];
+    mbedtls_sha256_context c;
+    mbedtls_sha256_init(&c);
+    mbedtls_sha256_starts(&c, 0);
+    for (uint32_t off = 0; off < ota_total; off += sizeof blk) {
+        size_t n = ota_total - off < sizeof blk ? ota_total - off : sizeof blk;
+        if (esp_partition_read(ota_part, off, blk, n) != ESP_OK) { mbedtls_sha256_free(&c); return false; }
+        mbedtls_sha256_update(&c, blk, n);
+    }
+    mbedtls_sha256_finish(&c, out);
+    mbedtls_sha256_free(&c);
+    return true;
 }
 static void ota_abort_quiet() {   // the phone went away or asked to stop
     if (!ota_active) return;
@@ -1199,7 +1215,20 @@ static void ota_handle_write(const uint8_t *d, size_t n) {
         mbedtls_sha256_finish(&ota_sha, got);
         mbedtls_sha256_free(&ota_sha);
         ota_ctx_ready = false;
-        if (memcmp(got, ota_sha_want, 32) != 0) { ota_fail(5); return; }
+        // The running hash of the bytes received and a fresh hash of what landed in flash. The flash is what will boot, so it decides;
+        // if they disagree, the screen shows the first bytes of each (S = stream, F = flash, W = wanted) so the cause can be found.
+        uint8_t fl[32] = {0};
+        bool fl_ok = ota_flash_hash(fl);
+        bool stream_ok = memcmp(got, ota_sha_want, 32) == 0;
+        bool flash_ok = fl_ok && memcmp(fl, ota_sha_want, 32) == 0;
+        if (!flash_ok) {
+            char msg[40];
+            snprintf(msg, sizeof msg, "S%02X%02X F%02X%02X W%02X%02X", got[0], got[1], fl[0], fl[1], ota_sha_want[0], ota_sha_want[1]);
+            ESP_LOGW(TAG, "update hash mismatch: %s (flash read %s)", msg, fl_ok ? "ok" : "failed");
+            ota_fail(5, msg);
+            return;
+        }
+        if (!stream_ok) ESP_LOGW(TAG, "running hash differed but the flash copy is correct; accepting");
         esp_err_t e = esp_ota_end(ota_h);
         ota_h = 0;
         if (e != ESP_OK || esp_ota_set_boot_partition(ota_part) != ESP_OK) { ota_fail(6); return; }
