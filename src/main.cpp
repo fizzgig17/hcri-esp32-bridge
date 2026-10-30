@@ -1053,7 +1053,7 @@ static int ble_gap_cb(struct ble_gap_event *ev, void *) {
         if (ev->connect.status == 0) {
             ble_conn = ev->connect.conn_handle;
             ble_conn_count++;
-            ESP_LOGI(TAG, "BLE connected (OTA test build)");
+            ESP_LOGI(TAG, "BLE connected (OTA test 2)");
         } else {
             ble_advertise();
         }
