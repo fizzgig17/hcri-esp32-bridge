@@ -191,3 +191,5 @@ GPLv3 (see `LICENSE`), derived from Torch-Bearer-Tools / tobes-ui. Copyright fiz
 
 - Torch Bearer: the top button (as seen on the screen) starts Live, the bottom button takes one scan; the roles swap when the display is flipped. Any press stops Live. A press acts when it is let go.
 - Hold either button for 2 seconds to put the board into deep sleep (screen off; on the Pro the instrument power boost is cut). Press a wake button to start it again: both side buttons on the T-Display-S3 Pro, the GPIO 14 button on the T-Display S3 (BOOT is not used to wake it). It reboots, so the phone and instrument reconnect.
+
+_The firmware can be updated from the phone; the update path has been tested end to end on the T-Display S3 Pro._
