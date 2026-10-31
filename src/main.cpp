@@ -890,7 +890,7 @@ static volatile bool ble_scan_req = false;
 static volatile bool ble_resend_req = false;
 static volatile bool ble_live_req = false;   // command 06: keep scanning until cancelled (05)
 // Developer simulation (command 07): which instrument to pretend is attached when none is plugged in.
-static volatile bool sim_tk_run = false;      // simulated TKLamp: the app has a run going (command 0A 01), so only STOP is offered
+static volatile bool sim_tk_run = false;      // simulated TKLamp: the app has a run going (command 0A 01), so the top button is STOP
 static volatile uint8_t sim_inject = 0;      // simulation: a button press sent by the phone (command 09 <1 top|2 bottom>), taken by sim_poll()
 static volatile uint8_t sim_kind = 0;        // 0 off, 1 Torch Bearer, 2 ColorMunki, 3 TKLamp tester
 static volatile bool sim_changed = false;    // command 07 arrived: restart the simulated instrument
@@ -1309,7 +1309,7 @@ static int ble_access_cb(uint16_t, uint16_t, struct ble_gatt_access_ctxt *ctxt, 
                 uint8_t v = 0;
                 if (OS_MBUF_PKTLEN(ctxt->om) >= 2 && os_mbuf_copydata(ctxt->om, 1, 1, &v) == 0) { sim_kind = v <= 3 ? v : 0; sim_changed = true; }
             }
-            if (cmd == 0x0A) {  // 0x0A <0|1>: the app has a TKLamp run going (simulation only): the screen then offers only STOP
+            if (cmd == 0x0A) {  // 0x0A <0|1>: the app has a TKLamp run going (simulation only): the screen then reads RECORDING RUN
                 uint8_t v = 0;
                 if (OS_MBUF_PKTLEN(ctxt->om) >= 2 && os_mbuf_copydata(ctxt->om, 1, 1, &v) == 0) { sim_tk_run = v != 0; sim_redraw = true; }
             }
@@ -1461,11 +1461,9 @@ static void draw_tb_buttons() {
         for (int i = 0; i <= 5; i++) fill(cx - i, 3 + i, 2 * i + 1, 1, sim_tk_run ? RED : YELLOW);
         fill(cx - 1, 9, 3, 8, sim_tk_run ? RED : YELLOW);
         text(tx, 26, tl, 1, sim_tk_run ? RED : WHITE);
-        if (!sim_tk_run) {
-            for (int i = 0; i <= 5; i++) fill(cx - i, 166 - i, 2 * i + 1, 1, YELLOW);
-            fill(cx - 1, 153, 3, 8, YELLOW);
-            text(left ? 1 : W - 25, 142, "NEXT", 1, WHITE);
-        }
+        for (int i = 0; i <= 5; i++) fill(cx - i, 166 - i, 2 * i + 1, 1, YELLOW);
+        fill(cx - 1, 153, 3, 8, YELLOW);
+        text(left ? 1 : W - 25, 142, "NEXT", 1, WHITE);
         return;
     }
     if (!live && (!munki || sim_kind == 2 || tk)) {
@@ -2525,14 +2523,15 @@ static void ui_tk(float lm, bool have, bool stale) {
         char s[16];
         snprintf(s, sizeof s, lm >= 100.0f ? "%.0f" : "%.1f", lm);   // like the app: one decimal below 100 lm
         int w = (int)strlen(s) * 36;
-        text((W - w) / 2, 52, s, 6, WHITE);
-        text(W / 2 - 12, 104, "LM", 2, GREY);
+        const int ny = sim_kind == 3 ? 28 : 52;   // the simulator needs room under the number for what the buttons do
+        text((W - w) / 2, ny, s, 6, WHITE);
+        text(W / 2 - 12, ny + 52, "LM", 2, GREY);
     } else {
         text(20 + lpad(), 70, stale ? "TESTER STOPPED SENDING" : "WAITING FOR DATA", 2, YELLOW);
     }
     if (sim_kind == 3) {   // what the two buttons do (the arrows point at them)
-        text(6 + lpad(), 108, sim_tk_run ? "TOP: STOP RUN" : "TOP: START RUN", 1, sim_tk_run ? RED : YELLOW);
-        if (!sim_tk_run) text(6 + lpad(), 120, "BOTTOM: NEXT LEVEL", 1, YELLOW);
+        text(6 + lpad(), 104, sim_tk_run ? "RECORDING RUN - PRESS TOP TO STOP" : "PRESS TOP BUTTON TO START A RUN", 1, sim_tk_run ? RED : YELLOW);
+        text(6 + lpad(), 116, "PRESS BOTTOM BUTTON FOR NEXT LEVEL", 1, YELLOW);
     }
     draw_btn_note();
     textf(6, 160, 1, GREY, "FW %s", fw_label());
@@ -2806,7 +2805,7 @@ static void sim_tk_step(int &st, int64_t &last_us) {
     uint8_t b = sim_poll();
     int64_t now = esp_timer_get_time();
     if (b) {
-        if (b == 2 && !sim_tk_run) st = (st + 1) % 7;   // the top button is the run's Start / Stop in the app (nothing to change here); no level changes during a run
+        if (b == 2) st = (st + 1) % 7;   // the top button is the run's Start / Stop in the app (nothing to change here); the level can change during a run too
         sim_tk_draw(st, st < 5 ? SIM_TK_LM[st] : 0);
         last_us = now;
     }
