@@ -1547,7 +1547,9 @@ static void header(const char *right, uint16_t rc) {
     text(6 + lpad(), 4, meter_kind == 1 ? "COLORMUNKI" : meter_kind == 2 ? "TKLAMP" : hdr_generic ? "HCRI BRIDGE" : "TORCH BEARER", 2, WHITE);
     // On the arrow screens the upright arrow owns the top-right corner, so the right-hand status steps left of it.
     int edge = (shown != 0 && !arrow_bottom_left()) ? W - 24 : W - 6;
-    text(edge - (int)strlen(right) * 12, 4, right, 2, rc);
+    const int rx = edge - (int)strlen(right) * 12;
+    if (rx < BATT_X + BATT_W + 4) text(edge - (int)strlen(right) * 6, 8, right, 1, rc);   // too wide beside the battery figure: small text instead of touching it
+    else text(rx, 4, right, 2, rc);
     draw_battery();
     for (int x = 0; x < W; x++) px(x, 22, GREY);
     draw_app_link();
@@ -2534,7 +2536,7 @@ static void ui_tk(float lm, bool have, bool stale) {
         text(6 + lpad(), 110, "PRESS BOTTOM BUTTON FOR NEXT LEVEL", 1, YELLOW);
     }
     draw_btn_note();
-    textf(6, 160, 1, GREY, "FW %s", fw_label());
+    textf(6 + lpad(), 160, 1, GREY, "FW %s", fw_label());   // clear of the button arrow on its side
     diag_on = true;
     draw_diag();
     present();
