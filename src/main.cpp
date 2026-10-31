@@ -85,9 +85,9 @@ static volatile int64_t ota_redraw_at = 0; // ... but not before this time (esp_
 #define PIN_SD_CS     14   // shares the SPI bus; keep it deselected
 #define PIN_I2C_SDA   5
 #define PIN_I2C_SCL   6
-#define PIN_BTN_A     12   // side button, top press: starts a scan
-#define PIN_BTN_B     16   // side button, bottom press: starts a scan
-#define PIN_BTN_BOOT  0    // BOOT: shown in the button readout, but does not start a scan
+#define PIN_BTN_A     0    // the two buttons seen on the Pro: GPIO 0 is the upper one with the screen unflipped...
+#define PIN_BTN_B     16   // ...and GPIO 16 the lower one
+#define PIN_BTN_A2    12   // earlier firmware used GPIO 12 as the upper button; still counts as A, in case a board has it
 #else
 #define PIN_POWER_ON 15
 #define PIN_LCD_BL   38
@@ -1470,11 +1470,11 @@ static void draw_btn_arrow() {
 
 // ------------------------------------------------------- button readout ----
 // Which button pins are held, shown on the idle and result screens and logged, to see what each physical button does.
-// The Pro also watches BOOT (GPIO 0), which is not a scan button there.
+// The Pro also watches GPIO 12, which counts as button A.
 static const int WATCH_PINS[] = {
     PIN_BTN_A, PIN_BTN_B,
 #ifdef BOARD_PRO
-    PIN_BTN_BOOT,
+    PIN_BTN_A2,
 #endif
 };
 static const int N_WATCH = (int)(sizeof(WATCH_PINS) / sizeof(WATCH_PINS[0]));
@@ -1760,8 +1760,14 @@ static void btn_tick() {
     }
 }
 
+static inline bool btn_a_low() {
+#ifdef BOARD_PRO
+    if (gpio_get_level((gpio_num_t)PIN_BTN_A2) == 0) return true;
+#endif
+    return gpio_get_level((gpio_num_t)PIN_BTN_A) == 0;
+}
 static bool button_pressed() {
-    return gpio_get_level((gpio_num_t)PIN_BTN_A) == 0 || gpio_get_level((gpio_num_t)PIN_BTN_B) == 0;
+    return btn_a_low() || gpio_get_level((gpio_num_t)PIN_BTN_B) == 0;
 }
 
 // Torch Bearer button roles, as seen on the screen: the TOP button starts Live, the BOTTOM button takes one scan. The two
@@ -1769,8 +1775,8 @@ static bool button_pressed() {
 // Unflipped, A is the top one (the Pro's comments above: A = top press, B = bottom press). If a board's labels turn out the
 // wrong way round, swap A and B here -- this is the only place that decides it.
 static inline bool btn_pin_low(int pin) { return gpio_get_level((gpio_num_t)pin) == 0; }
-static bool btn_top_pressed() { return btn_pin_low(flipped ? PIN_BTN_B : PIN_BTN_A); }
-static bool btn_bottom_pressed() { return btn_pin_low(flipped ? PIN_BTN_A : PIN_BTN_B); }
+static bool btn_top_pressed() { return flipped ? btn_pin_low(PIN_BTN_B) : btn_a_low(); }
+static bool btn_bottom_pressed() { return flipped ? btn_a_low() : btn_pin_low(PIN_BTN_B); }
 
 #ifdef COLORMUNKI_PROBE
 // ------------------------------------------------------- ColorMunki probe ----
@@ -2809,7 +2815,7 @@ extern "C" void app_main() {
     bi.pull_up_en = GPIO_PULLUP_ENABLE;
     bi.pin_bit_mask = (1ULL << PIN_BTN_A) | (1ULL << PIN_BTN_B);
 #ifdef BOARD_PRO
-    bi.pin_bit_mask |= (1ULL << PIN_BTN_BOOT);   // watched for the on-screen button readout only
+    bi.pin_bit_mask |= (1ULL << PIN_BTN_A2);
 #endif
     gpio_config(&bi);
 
