@@ -19,7 +19,8 @@ Hands-off examples:  py hcri_companion_esp32_bridge.py --s3 --prod --yes
                      py hcri_companion_esp32_bridge.py --s3pro --dev --yes
 Without --prod or --dev, --yes uses the production build.
 
-Needs Python 3.8+ and esptool (the script installs it with pip if it is missing).
+Needs Python 3.8+ and esptool (the script installs it with pip if it is missing; on systems that refuse that,
+such as Arch or newer Debian/Ubuntu, it makes a private virtual environment in your home folder instead).
 No other setup: it downloads the firmware from this repo's GitHub releases.
 
 What it can and can't detect: the chip (ESP32-S3), flash size and PSRAM come from the board
@@ -64,12 +65,66 @@ TAGS = {
 }
 
 
+# The Python that has esptool. Normally the one running this script; on systems that refuse system-wide pip installs
+# (Arch, newer Debian/Ubuntu/Fedora: "externally-managed-environment") it is a private virtual environment instead.
+ESPTOOL_PY = sys.executable
+VENV_DIR = os.path.join(os.path.expanduser("~"), ".hcri-companion-esp32-bridge-venv")
+
+
+def _has_esptool(py):
+    return subprocess.call([py, "-c", "import esptool"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0
+
+
+def _pip_install(py):
+    r = subprocess.run([py, "-m", "pip", "install", "--quiet", "esptool"],
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+    return r.returncode == 0, r.stdout
+
+
+def _venv_python():
+    return os.path.join(VENV_DIR, "Scripts", "python.exe") if os.name == "nt" else os.path.join(VENV_DIR, "bin", "python")
+
+
 def ensure_esptool():
-    try:
-        import esptool  # noqa: F401
-    except ImportError:
-        print("Installing esptool (one time)...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "esptool"])
+    global ESPTOOL_PY
+    if _has_esptool(sys.executable):
+        return
+    vpy0 = _venv_python()
+    if os.path.exists(vpy0) and _has_esptool(vpy0):   # made on an earlier run
+        ESPTOOL_PY = vpy0
+        return
+    print("Installing esptool (one time)...")
+    ok, out = _pip_install(sys.executable)
+    if ok and _has_esptool(sys.executable):
+        return
+    # pip refused (PEP 668 "externally-managed-environment", no permission, or no pip). Use a private virtual
+    # environment in the home folder so nothing system-wide is touched.
+    vpy = _venv_python()
+    if not (os.path.exists(vpy) and _has_esptool(vpy)):
+        print("The system Python does not allow installing packages, so esptool goes into its own folder: " + VENV_DIR)
+        if not os.path.exists(vpy):
+            r = subprocess.run([sys.executable, "-m", "venv", VENV_DIR],
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+            if r.returncode != 0 or not os.path.exists(vpy):
+                _esptool_help(out + "\n" + r.stdout)
+        ok, out2 = _pip_install(vpy)
+        if not ok or not _has_esptool(vpy):
+            _esptool_help(out + "\n" + out2)
+    ESPTOOL_PY = vpy
+
+
+def _esptool_help(detail):
+    print("\nCould not install esptool automatically.")
+    d = detail.strip()
+    if d:
+        print("Details:\n" + "\n".join("  " + ln for ln in d.splitlines()[-8:]))
+    print("\nInstall it yourself, then run this program again. Any one of these works:")
+    print("  Arch / Manjaro:     sudo pacman -S esptool          (or: sudo pacman -S python-pipx && pipx install esptool)")
+    print("  Debian / Ubuntu:    sudo apt install python3-venv   (then run this program again), or: sudo apt install esptool")
+    print("  Fedora:             sudo dnf install esptool")
+    print("  Any system:         pipx install esptool            (or: python3 -m venv ~/esptool-venv && ~/esptool-venv/bin/pip install esptool)")
+    print("If the 'esptool' command works in a terminal but this program still fails, tell us which system you are on.")
+    sys.exit(1)
 
 
 def load_state():
@@ -122,7 +177,7 @@ def find_ports():
 
 
 def run_esptool(args, capture=False):
-    cmd = [sys.executable, "-m", "esptool"] + args
+    cmd = [ESPTOOL_PY, "-m", "esptool"] + args
     if capture:
         r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
         return r.returncode, r.stdout
