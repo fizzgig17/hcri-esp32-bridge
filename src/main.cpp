@@ -1437,35 +1437,34 @@ static void link_tick() {
 
 // Pro, Torch Bearer: READ arrow at the top (top button, word under the arrow), LIVE arrow at the bottom (bottom button,
 // word above the arrow), on whichever side the buttons are for the current orientation.
-static int lpad() { return (tb_ui && arrow_bottom_left()) ? 24 : 0; }
+static int lpad() { return ((tb_ui || arrow_label) && arrow_bottom_left()) ? 24 : 0; }
 static void draw_tb_buttons() {
     const bool left = arrow_bottom_left();
-    const bool live = sim_live_banner || prog_mode == 2;   // during Live only the bottom button matters, and it stops it
+    const bool munki = arrow_label;                          // ColorMunki screen: bottom button reads, top turns the (simulated) dial
+    const bool live = !munki && (sim_live_banner || prog_mode == 2);   // during Live only the bottom button matters, and it stops it
     const int cx = left ? 8 : 312;
     const int lx = left ? 1 : W - 25;
-    if (!live) {
+    if (!live && (!munki || sim_kind == 2)) {
         for (int i = 0; i <= 5; i++) fill(cx - i, 3 + i, 2 * i + 1, 1, YELLOW);     // up arrow, tip at the top
         fill(cx - 1, 9, 3, 8, YELLOW);
-        text(lx, 26, "READ", 1, WHITE);
+        text(lx, 26, munki ? "DIAL" : "READ", 1, WHITE);
     }
     for (int i = 0; i <= 5; i++) fill(cx - i, 166 - i, 2 * i + 1, 1, YELLOW);   // down arrow, tip at the bottom
     fill(cx - 1, 153, 3, 8, YELLOW);
-    text(lx, 142, live ? "STOP" : "LIVE", 1, live ? RED : WHITE);
+    text(lx, 142, munki ? "READ" : live ? "STOP" : "LIVE", 1, live ? RED : WHITE);
 }
 
 static void draw_btn_arrow() {
 #ifdef BOARD_PRO
-    if (tb_ui) { draw_tb_buttons(); return; }
+    if (tb_ui || arrow_label) { draw_tb_buttons(); return; }
     if (!arrow_bottom_left()) {
         const int cx = 312;
         for (int i = 0; i <= 5; i++) fill(cx - i, 3 + i, 2 * i + 1, 1, YELLOW);   // head, tip at the top
         fill(cx - 1, 9, 3, 8, YELLOW);                                              // shaft
-        if (arrow_label) text(W - 25, 26, "READ", 1, WHITE);
     } else {
         const int cx = 8;
         for (int i = 0; i <= 5; i++) fill(cx - i, 166 - i, 2 * i + 1, 1, YELLOW); // head, tip at the bottom
         fill(cx - 1, 153, 3, 8, YELLOW);
-        if (arrow_label) text(1, 142, "READ", 1, WHITE);
     }
 #else
     if (!arrow_bottom_left()) {
@@ -2280,18 +2279,19 @@ static void ui_munki_ready() {
 #ifdef BOARD_PRO
     arrow_label = true;
 #endif
+    const int L = lpad();
     header("READY", GREEN);
-    text(6, 30, "DIAL", 1, GREY);
-    text(6, 40, mk_dial_name(mk_dial), 3, YELLOW);
+    text(L + 6, 30, "DIAL", 1, GREY);
+    text(L + 6, 40, mk_dial_name(mk_dial), 3, YELLOW);
     bool dv = sim_kind == 2 ? sim_dark : munki::dark_valid();
-    text(6, 70, dv ? "CALIBRATED" : "NOT CALIBRATED", 2, dv ? GREEN : YELLOW);
-    if (*mk_msg) text(6, 94, mk_msg, 1, RED);
-    else if (mk_dial == munki::POS_CALIB) text(6, 94, "PRESS BUTTON TO CALIBRATE", 1, CYAN);
-    else if (mk_dial == munki::POS_AMBIENT) text(6, 94, dv ? "PRESS BUTTON TO MEASURE" : "CALIBRATE FIRST (DIAL TO CALIBRATION)", 1, dv ? WHITE : YELLOW);
-    else text(6, 94, "SET THE DIAL TO AMBIENT (OR CALIBRATION)", 1, RED);
+    text(L + 6, 70, dv ? "CALIBRATED" : "NOT CALIBRATED", 2, dv ? GREEN : YELLOW);
+    if (*mk_msg) text(L + 6, 94, mk_msg, 1, RED);
+    else if (mk_dial == munki::POS_CALIB) text(L + 6, 94, "PRESS BUTTON TO CALIBRATE", 1, CYAN);
+    else if (mk_dial == munki::POS_AMBIENT) text(L + 6, 94, dv ? "PRESS BUTTON TO MEASURE" : "CALIBRATE FIRST (DIAL TO CALIBRATION)", 1, dv ? WHITE : YELLOW);
+    else text(L + 6, 94, "SET THE DIAL TO AMBIENT (OR CALIBRATION)", 1, RED);
     draw_btn_note();
     draw_btn_arrow();
-    textf(arrow_bottom_left() ? 18 : 6, 160, 1, GREY, "FW %s", fw_label());
+    textf(arrow_bottom_left() ? 30 : 6, 160, 1, GREY, "FW %s", fw_label());
     present();
 }
 
@@ -2673,7 +2673,7 @@ static void sim_tb_step(int &variant) {
         sim_latch_run = true;
         if (xTaskCreate(sim_latch_task, "simbtn", 4096, NULL, 5, NULL) != pdPASS) { sim_latch_run = false; sim_latch_done = true; }
         while (!sim_latch && sim_kind == 1 && !sim_changed && !scan_cancelled() && !ota_active) {
-            sim_fill_scan(340, 1000, variant + n / 3, 14.0f);
+            sim_fill_scan(340, 1000, variant, 14.0f);   // one light throughout; only the noise moves
             have_result = true;
             ble_status(2, 0, scan.exposure_ms);
             ble_send_result();   // the app (in Live) draws the same readings
