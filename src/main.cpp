@@ -2530,8 +2530,8 @@ static void ui_tk(float lm, bool have, bool stale) {
         text(20 + lpad(), 70, stale ? "TESTER STOPPED SENDING" : "WAITING FOR DATA", 2, YELLOW);
     }
     if (sim_kind == 3) {   // what the two buttons do (the arrows point at them)
-        text(6 + lpad(), 104, sim_tk_run ? "RECORDING RUN - PRESS TOP TO STOP" : "PRESS TOP BUTTON TO START A RUN", 1, sim_tk_run ? RED : YELLOW);
-        text(6 + lpad(), 116, "PRESS BOTTOM BUTTON FOR NEXT LEVEL", 1, YELLOW);
+        text(6 + lpad(), 100, sim_tk_run ? "RECORDING RUN - PRESS TOP TO STOP" : "PRESS TOP BUTTON TO START A RUN", 1, sim_tk_run ? RED : YELLOW);
+        text(6 + lpad(), 110, "PRESS BOTTOM BUTTON FOR NEXT LEVEL", 1, YELLOW);
     }
     draw_btn_note();
     textf(6, 160, 1, GREY, "FW %s", fw_label());
