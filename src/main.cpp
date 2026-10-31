@@ -325,6 +325,7 @@ static bool waiting_shown = false;  // the NO USB screen is on show
 static bool tb_ui = false;
 // What the progress screen says: 0 plain, 1 "PERFORMING READ", 2 "PERFORMING LIVE READ", 3 "SIMULATED READ".
 static int prog_mode = 0;
+static inline bool arrow_bottom_left() { return !flipped; }   // (declared early: the app link uses it) both boards now start with the buttons at the bottom-left
 static void clear() { memset(fb, 0, W * H * 2); shown = 0; waiting_shown = false; tb_ui = false; }
 
 static inline void px(int x, int y, uint16_t c) {
@@ -1426,7 +1427,6 @@ static void link_tick() {
 // A small yellow arrow pointing at the scan button on the READY and result screens. Unflipped, the buttons are at the
 // bottom-left on both boards: S3 arrow bottom-left pointing left, Pro arrow bottom-left pointing down. Flipped, they are
 // at the top-right: S3 arrow pointing right, Pro arrow pointing up.
-static inline bool arrow_bottom_left() { return !flipped; }   // both boards now start with the buttons at the bottom-left
 
 // Pro, Torch Bearer: READ arrow at the top (top button, word under the arrow), LIVE arrow at the bottom (bottom button,
 // word above the arrow), on whichever side the buttons are for the current orientation.
