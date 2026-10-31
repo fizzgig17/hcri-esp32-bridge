@@ -2614,6 +2614,22 @@ static uint8_t sim_mk_flags() {
 
 // Torch Bearer: READY, READ (top button or phone: one simulated reading), LIVE (bottom button or phone: only announced,
 // only made-up readings are drawn; any press or the phone stops it).
+// While a simulated Live read draws its readings (which takes a while), a task watches the buttons so a press is never
+// missed: the first press seen is kept in sim_latch (1 top, 2 bottom) and stops the Live read.
+static volatile uint8_t sim_latch = 0;
+static volatile bool sim_latch_run = false, sim_latch_done = true;
+static void sim_latch_task(void *) {
+    while (sim_latch_run) {
+        if (!sim_latch) {
+            uint8_t w = sim_poll();
+            if (w) sim_latch = w;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    sim_latch_done = true;
+    vTaskDelete(NULL);
+}
+
 static void sim_tb_step(int &variant) {
     uint8_t b = sim_poll();
     bool live = ble_live_req || b == 2;
@@ -2627,18 +2643,23 @@ static void sim_tb_step(int &variant) {
         // Made-up readings, one every 0.7 s, drawn like the real Live screen; nothing is sent to the app.
         sim_live_banner = true;
         int n = 0;
-        bool stop = false;
-        while (!stop && sim_kind == 1 && !sim_changed && !scan_cancelled() && !ota_active) {
+        sim_latch = 0;
+        sim_latch_done = false;
+        sim_latch_run = true;
+        if (xTaskCreate(sim_latch_task, "simbtn", 4096, NULL, 5, NULL) != pdPASS) { sim_latch_run = false; sim_latch_done = true; }
+        while (!sim_latch && sim_kind == 1 && !sim_changed && !scan_cancelled() && !ota_active) {
             sim_fill_scan(340, 1000, variant + n / 4, 14.0f);
             have_result = true;
             ui_result(true);
             n++;
-            for (int i = 0; i < 23 && !stop && sim_kind == 1 && !sim_changed && !scan_cancelled(); i++) {
-                if (sim_poll()) stop = true;
-                else vTaskDelay(pdMS_TO_TICKS(30));
+            for (int i = 0; i < 23 && !sim_latch && sim_kind == 1 && !sim_changed && !scan_cancelled(); i++) {
+                vTaskDelay(pdMS_TO_TICKS(30));
                 flip_tick();   // a flip asked for from the phone applies during Live too
             }
         }
+        sim_latch_run = false;
+        while (!sim_latch_done) vTaskDelay(pdMS_TO_TICKS(10));
+        sim_latch = 0;
         sim_live_banner = false;
         if (sim_kind == 1) { ui_ready(); ble_status(0, 0, 0); }
     } else if (scanning) {
