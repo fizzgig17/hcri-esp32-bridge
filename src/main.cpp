@@ -2498,7 +2498,7 @@ static void ui_tk(float lm, bool have, bool stale) {
     header(stale ? "NO DATA" : "LIVE", stale ? RED : GREEN);
     if (have && !stale) {
         char s[16];
-        snprintf(s, sizeof s, "%.0f", lm);
+        snprintf(s, sizeof s, lm >= 100.0f ? "%.0f" : "%.1f", lm);   // like the app: one decimal below 100 lm
         int w = (int)strlen(s) * 36;
         text((W - w) / 2, 52, s, 6, WHITE);
         text(W / 2 - 12, 104, "LM", 2, GREY);
@@ -2758,7 +2758,7 @@ static void sim_mk_step(int &variant) {
 }
 
 // TKLamp tester: the bottom button steps forward through five lumen magnitudes, then WAITING FOR DATA and NO DATA; the
-// top button steps back. The lumen readings drift a little and go to the phone as live packets (06), like the real tester.
+// top button is the app's run Start / Stop. The lumen readings drift a little and go to the phone as live packets (06), like the real tester.
 static const float SIM_TK_LM[5] = {0.8f, 42.0f, 635.0f, 2480.0f, 18500.0f};
 static void sim_tk_draw(int st, float lm) {
     if (st < 5) ui_tk(lm, true, false);
@@ -2769,7 +2769,7 @@ static void sim_tk_step(int &st, int64_t &last_us) {
     uint8_t b = sim_poll();
     int64_t now = esp_timer_get_time();
     if (b) {
-        st = b == 2 ? (st + 1) % 7 : (st + 6) % 7;
+        if (b == 2) st = (st + 1) % 7;   // the top button is the run's Start / Stop in the app (nothing to change here)
         sim_tk_draw(st, st < 5 ? SIM_TK_LM[st] : 0);
         last_us = now;
     }
