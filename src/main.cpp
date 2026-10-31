@@ -61,11 +61,11 @@ static const char *TAG = "tobes";
 
 // The git commit this firmware was built from (tools/fw_version.py passes -DFW_GIT=<commit>), shown on the idle screens.
 #ifndef FW_GIT
-#define FW_GIT dev
+#define FW_GIT gdev   // the leading g is dropped below: a bare number like 0465550 would lose its zero
 #endif
 #define FW_STR2(x) #x
 #define FW_STR(x) FW_STR2(x)
-static const char *FW_VERSION = FW_STR(FW_GIT);
+static const char *FW_VERSION = FW_STR(FW_GIT) + 1;
 
 // True while the phone is sending a new firmware (BLE OTA, see "Firmware update" below). The idle-loop screen updates, the
 // buttons and the sleep timer stand still meanwhile, so nothing draws over the progress screen or puts the board to sleep.
