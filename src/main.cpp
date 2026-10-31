@@ -2636,6 +2636,7 @@ static void sim_tb_step(int &variant) {
             for (int i = 0; i < 23 && !stop && sim_kind == 1 && !sim_changed && !scan_cancelled(); i++) {
                 if (sim_poll()) stop = true;
                 else vTaskDelay(pdMS_TO_TICKS(30));
+                flip_tick();   // a flip asked for from the phone applies during Live too
             }
         }
         sim_live_banner = false;
