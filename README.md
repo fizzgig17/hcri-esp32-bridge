@@ -134,6 +134,8 @@ Result packets (little-endian):
 
 Test with nRF Connect: connect, subscribe to result + status, write 01 to the command characteristic.
 
+Result packet `08 01` (Torch Bearer): Live was started with the bridge's own button (not by the phone), so the app goes into Live as well; Live ends with the usual ready status. A simulated ColorMunki starts calibrated with the dial on Ambient. During Live the bottom button's label reads STOP.
+
 ### Simulating an instrument (developers)
 With nothing plugged in, write `07 <kind>` to the command characteristic (0 off, 1 Torch Bearer, 2 ColorMunki, 3 TKLamp tester).
 The board then advertises and behaves like that instrument, with made-up readings, so its screens can be worked on without the

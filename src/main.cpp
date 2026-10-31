@@ -1440,14 +1440,17 @@ static void link_tick() {
 static int lpad() { return (tb_ui && arrow_bottom_left()) ? 24 : 0; }
 static void draw_tb_buttons() {
     const bool left = arrow_bottom_left();
+    const bool live = sim_live_banner || prog_mode == 2;   // during Live only the bottom button matters, and it stops it
     const int cx = left ? 8 : 312;
     const int lx = left ? 1 : W - 25;
-    for (int i = 0; i <= 5; i++) fill(cx - i, 3 + i, 2 * i + 1, 1, YELLOW);     // up arrow, tip at the top
-    fill(cx - 1, 9, 3, 8, YELLOW);
-    text(lx, 26, "READ", 1, WHITE);
+    if (!live) {
+        for (int i = 0; i <= 5; i++) fill(cx - i, 3 + i, 2 * i + 1, 1, YELLOW);     // up arrow, tip at the top
+        fill(cx - 1, 9, 3, 8, YELLOW);
+        text(lx, 26, "READ", 1, WHITE);
+    }
     for (int i = 0; i <= 5; i++) fill(cx - i, 166 - i, 2 * i + 1, 1, YELLOW);   // down arrow, tip at the bottom
     fill(cx - 1, 153, 3, 8, YELLOW);
-    text(lx, 142, "LIVE", 1, WHITE);
+    text(lx, 142, live ? "STOP" : "LIVE", 1, live ? RED : WHITE);
 }
 
 static void draw_btn_arrow() {
@@ -1571,13 +1574,18 @@ static void ui_progress(int tries, float exp_ms, int status) {
     diag_on = false;
     ble_status(1, (uint8_t)tries, exp_ms);
     clear();
+#ifdef BOARD_PRO
+    if (prog_mode == 2) tb_ui = true;   // Live: the bottom button's STOP label is drawn, so the text steps clear of it
+#endif
+    const int L = lpad();
     header("SCANNING", YELLOW);
-    if (prog_mode) text(6, 28, prog_mode == 1 ? "PERFORMING READ" : prog_mode == 2 ? "PERFORMING LIVE READ" : "SIMULATED READ", 2, CYAN);
-    if (prog_mode == 2) text(6, 146, "PRESS BUTTON AGAIN TO STOP", 1, YELLOW);
-    textf(10, 50, 3, WHITE, "TRY %d", tries);
-    textf(10, 90, 2, CYAN, "EXPOSURE %.1f MS", exp_ms);
-    text(10, 115, status == 1 ? "TOO BRIGHT - ADJUSTING" : status == 2 ? "TOO DIM - ADJUSTING" : "OK", 2,
+    if (prog_mode) text(L + 6, 28, prog_mode == 1 ? "PERFORMING READ" : prog_mode == 2 ? "PERFORMING LIVE READ" : "SIMULATED READ", 2, CYAN);
+    if (prog_mode == 2) text(L + 6, 146, "PRESS BUTTON AGAIN TO STOP", 1, YELLOW);
+    textf(L + 10, 50, 3, WHITE, "TRY %d", tries);
+    textf(L + 10, 90, 2, CYAN, "EXPOSURE %.1f MS", exp_ms);
+    text(L + 10, 115, status == 1 ? "TOO BRIGHT - ADJUSTING" : status == 2 ? "TOO DIM - ADJUSTING" : "OK", 2,
          status == 0 ? GREEN : YELLOW);
+    if (tb_ui) draw_btn_arrow();
     present();
 }
 
@@ -2563,6 +2571,13 @@ static void tk_session() {
 // advertises and reports itself as that instrument, so the app connects to it as usual. Physical button presses do what they
 // would on the real instrument and are also sent to the app (result packet 07), so the app can show them.
 
+// Result packet 08 01: Live was started with the bridge's own button, so the app can go into Live too (it ends by the usual
+// "ready" status). Not sent when the phone asked for Live itself.
+static void ble_live_by_button() {
+    uint8_t pk[2] = {0x08, 0x01};
+    ble_notify(res_handle, res_sub, pk, sizeof pk);
+}
+
 // Reports a physical button press (pressed = 1) or release (pressed = 0, with how long it was held) to the app.
 static void sim_button_event(uint8_t which, bool pressed, uint16_t held_ms) {
     uint8_t pk[9] = {0x07, which, (uint8_t)(pressed ? 1 : 0)};
@@ -2644,11 +2659,13 @@ static void sim_tb_step(int &variant) {
     bool scanning = ble_scan_req || b == 1;
     if (ble_resend_req) { ble_resend_req = false; ble_send_result(); }
     if (live) {
-        scan_started_us = ble_live_req ? ble_scan_req_us : esp_timer_get_time();
+        const bool by_app = ble_live_req;
+        scan_started_us = by_app ? ble_scan_req_us : esp_timer_get_time();
         ble_live_req = false;
         ble_scan_req = false;
+        if (!by_app) ble_live_by_button();   // the app goes into Live as well
         ble_status(1, 0, 0);
-        // Made-up readings, one every 0.7 s, drawn like the real Live screen; nothing is sent to the app.
+        // Made-up readings, about four a second, drawn like the real Live screen and sent to the app.
         sim_live_banner = true;
         int n = 0;
         sim_latch = 0;
@@ -2656,11 +2673,13 @@ static void sim_tb_step(int &variant) {
         sim_latch_run = true;
         if (xTaskCreate(sim_latch_task, "simbtn", 4096, NULL, 5, NULL) != pdPASS) { sim_latch_run = false; sim_latch_done = true; }
         while (!sim_latch && sim_kind == 1 && !sim_changed && !scan_cancelled() && !ota_active) {
-            sim_fill_scan(340, 1000, variant + n / 4, 14.0f);
+            sim_fill_scan(340, 1000, variant + n / 3, 14.0f);
             have_result = true;
+            ble_status(2, 0, scan.exposure_ms);
+            ble_send_result();   // the app (in Live) draws the same readings
             ui_result(true);
             n++;
-            for (int i = 0; i < 23 && !sim_latch && sim_kind == 1 && !sim_changed && !scan_cancelled(); i++) {
+            for (int i = 0; i < 6 && !sim_latch && sim_kind == 1 && !sim_changed && !scan_cancelled(); i++) {
                 vTaskDelay(pdMS_TO_TICKS(30));
                 flip_tick();   // a flip asked for from the phone applies during Live too
             }
@@ -2794,8 +2813,9 @@ static void sim_session() {
         strncpy(device_id, "COLORMUNKI", sizeof device_id);
         range_lo = 380;
         range_hi = 730;
-        sim_dark = false;
-        mk_dial = munki::POS_CALIB;
+        sim_dark = true;                    // starts calibrated, dial on Ambient, so a reading can be taken at once
+        sim_dark_us = esp_timer_get_time();
+        mk_dial = munki::POS_AMBIENT;
         mk_msg = "";
         meter_cal_age_min = sim_cal_age;
         meter_flags = sim_mk_flags();
@@ -2932,8 +2952,10 @@ extern "C" void app_main() {
                 } else {
                     scan_started_us = ble_scan_req_us;
                 }
+                const bool by_button = live_from_button;
                 ble_live_req = false;
                 ble_scan_req = false;
+                if (by_button) ble_live_by_button();   // the app goes into Live as well
                 prog_mode = 2;
                 ui_scanning();
                 ble_status(1, 0, 0);
