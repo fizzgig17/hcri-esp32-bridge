@@ -840,6 +840,9 @@ static int tb_live(progress_fn progress, emit_fn emit, stop_fn stop_req) {
 //   0002 command  (write)  : 01 = scan now, 02 = resend last result, 06 = live: keep scanning and send every locked result
 //                            until 05 (Torch Bearer only; each result is a normal summary + header + data + end), 05 = cancel the reading in progress (ColorMunki:
 //                            stops at its next step and goes back to ready without sending a result)
+//                            07 <kind> = developer simulation: pretend instrument <kind> is attached (0 off, 1 Torch Bearer, 2 ColorMunki,
+//                            3 TKLamp tester) when none is plugged in. Held in RAM only (a restart ends it). While it is on, the board
+//                            behaves like that instrument (screens, status, fake readings) and reports its own button presses, see 07 below.
 //   0003 result   (notify/read): summary packet, then the full spectrum in chunks
 //   0004 status   (notify/read): [state u8][try u8][exposure_ms f32]
 //   0005 update   (write, write-no-response, notify, read): firmware update over Bluetooth, see "Firmware update" below
@@ -853,6 +856,8 @@ static int tb_live(progress_fn progress, emit_fn emit, stop_fn stop_req) {
 //   end      : 04 | chunks u8
 //   live     : 06 | ms u32 | raw u32   (TKLamp tester only: one reading about every 220 ms, ms = board uptime, raw = the
 //              tester's sensor count, lumens = raw / ~313.2 on a calibrated tester; scaling is done in the app)
+//   button   : 07 | button u8 (1 top, 2 bottom) | pressed u8 (1 down, 0 up) | ms u32 (board uptime) | held_ms u16 (on release, else 0)
+//              (only while a simulated instrument is on; tells the app which physical button was pressed)
 //   diag     : 05 | id u8 | seq u8 | last u8 | bytes...   (ColorMunki diagnostics, sent after the end marker; apps that
 //              don't know 05 ignore it. id 1 = the reading's raw sensor data, id 2 = the instrument's calibration
 //              block, once per connection. Used to develop the high-resolution mode offline; see tools/munki_diag.py.)
@@ -871,6 +876,12 @@ static uint8_t own_addr_type;
 static volatile bool ble_scan_req = false;
 static volatile bool ble_resend_req = false;
 static volatile bool ble_live_req = false;   // command 06: keep scanning until cancelled (05)
+// Developer simulation (command 07): which instrument to pretend is attached when none is plugged in.
+static volatile uint8_t sim_kind = 0;        // 0 off, 1 Torch Bearer, 2 ColorMunki, 3 TKLamp tester
+static volatile bool sim_changed = false;    // command 07 arrived: restart the simulated instrument
+static volatile bool sim_redraw = false;     // a firmware update ended: redraw the simulated screen
+[[maybe_unused]] static bool sim_dark = false;                // simulated ColorMunki: dark calibration done
+[[maybe_unused]] static int64_t sim_dark_us = 0;
 // Cancel (command 05) applies to a reading only if it arrived after that reading was requested, so a late cancel
 // can never swallow the next reading.
 static volatile int64_t ble_scan_req_us = 0, ble_cancel_us = 0;
@@ -1278,6 +1289,10 @@ static int ble_access_cb(uint16_t, uint16_t, struct ble_gatt_access_ctxt *ctxt, 
             if (cmd == 0x05) ble_cancel_us = esp_timer_get_time();   // cancel the reading in progress (ColorMunki)
             if (cmd == 0x02) ble_resend_req = true;
             if (cmd == 0x06) { ble_scan_req_us = esp_timer_get_time(); ble_live_req = true; }   // live (continuous) scanning, Torch Bearer only; 05 stops it
+            if (cmd == 0x07) {  // 0x07 <kind>: developer simulation of an attached instrument (nothing is plugged in)
+                uint8_t v = 0;
+                if (OS_MBUF_PKTLEN(ctxt->om) >= 2 && os_mbuf_copydata(ctxt->om, 1, 1, &v) == 0) { sim_kind = v <= 3 ? v : 0; sim_changed = true; }
+            }
             if (cmd == 0x03) {  // 0x03 <0|1>: display orientation, 1 = turned 180 degrees
                 uint8_t v = 0;
                 if (OS_MBUF_PKTLEN(ctxt->om) >= 2 && os_mbuf_copydata(ctxt->om, 1, 1, &v) == 0) flip_req = v ? 1 : 0;
@@ -1464,6 +1479,13 @@ static void draw_btn_note() {
     if (btn_text[0]) text(20, 122, btn_text, 1, CYAN);
 }
 
+// "FW <commit>", with SIM added while a simulated instrument is on, so a simulation is never mistaken for a real one.
+static const char *fw_label() {
+    static char b[40];
+    snprintf(b, sizeof b, sim_kind ? "%s SIM" : "%s", FW_VERSION);
+    return b;
+}
+
 static void header(const char *right, uint16_t rc) {
     text(6, 4, meter_kind == 1 ? "COLORMUNKI" : meter_kind == 2 ? "TKLAMP" : hdr_generic ? "HCRI BRIDGE" : "TORCH BEARER", 2, WHITE);
     // On the arrow screens the upright arrow owns the top-right corner, so the right-hand status steps left of it.
@@ -1484,7 +1506,7 @@ static void ui_waiting() {
     text(20, 94, "OR TKLAMP, VIA OTG CABLE", 2, GREY);
     waiting_shown = true;
     draw_btn_note();
-    textf(6, 160, 1, GREY, "FW %s", FW_VERSION);
+    textf(6, 160, 1, GREY, "FW %s", fw_label());
     diag_on = true;
     draw_diag();
     present();
@@ -1502,7 +1524,7 @@ static void ui_ready() {
     text(20, 100, "SCAN", 2, WHITE);      // bottom button
     draw_btn_note();
     draw_btn_arrow();
-    textf(arrow_bottom_left() ? 18 : 6, 160, 1, GREY, "FW %s", FW_VERSION);
+    textf(arrow_bottom_left() ? 18 : 6, 160, 1, GREY, "FW %s", fw_label());
     diag_on = true;
     draw_diag();
     present();
@@ -1540,7 +1562,7 @@ static void ota_draw(int pct, const char *msg, bool bad) {
 }
 // After a failed or cancelled update: the screen the board was on before.
 static void ota_restore_ui() {
-    if (usb_connected) ui_ready(); else ui_waiting();
+    if (usb_connected) ui_ready(); else if (sim_kind) sim_redraw = true; else ui_waiting();
 }
 
 static uint16_t wl_color(int nm) {   // rough wavelength to colour
@@ -2200,7 +2222,7 @@ static void ui_munki_ready() {
     header("READY", GREEN);
     text(6, 30, "DIAL", 1, GREY);
     text(6, 40, mk_dial_name(mk_dial), 3, YELLOW);
-    bool dv = munki::dark_valid();
+    bool dv = sim_kind == 2 ? sim_dark : munki::dark_valid();
     text(6, 70, dv ? "CALIBRATED" : "NOT CALIBRATED", 2, dv ? GREEN : YELLOW);
     if (*mk_msg) text(6, 94, mk_msg, 1, RED);
     else if (mk_dial == munki::POS_CALIB) text(6, 94, "PRESS BUTTON TO CALIBRATE", 1, CYAN);
@@ -2208,7 +2230,7 @@ static void ui_munki_ready() {
     else text(6, 94, "SET THE DIAL TO AMBIENT (OR CALIBRATION)", 1, RED);
     draw_btn_note();
     draw_btn_arrow();
-    textf(arrow_bottom_left() ? 18 : 6, 160, 1, GREY, "FW %s", FW_VERSION);
+    textf(arrow_bottom_left() ? 18 : 6, 160, 1, GREY, "FW %s", fw_label());
     present();
 }
 
@@ -2423,7 +2445,7 @@ static void ui_tk(float lm, bool have, bool stale) {
         text(20, 70, stale ? "TESTER STOPPED SENDING" : "WAITING FOR DATA", 2, YELLOW);
     }
     draw_btn_note();
-    textf(6, 160, 1, GREY, "FW %s", FW_VERSION);
+    textf(6, 160, 1, GREY, "FW %s", fw_label());
     diag_on = true;
     draw_diag();
     present();
@@ -2480,6 +2502,259 @@ static void tk_session() {
 }
 
 // -------------------------------------------------------------- main ----
+// ----------------------------------------------- developer simulation ----
+// BLE command 07 <kind> makes the board behave like an instrument that is not plugged in, so each instrument's screens
+// can be worked on without the instrument: Torch Bearer (READY / SCANNING / DONE, LIVE), ColorMunki (dial, calibration,
+// measuring, errors) and the TKLamp tester (live lumens, waiting, no data). Readings are made up. It lives in RAM only, so a
+// restart ends it, and while it is on a plugged-in instrument is ignored (set the kind back to 0 to use it). The board
+// advertises and reports itself as that instrument, so the app connects to it as usual. Physical button presses do what they
+// would on the real instrument and are also sent to the app (result packet 07), so the app can show them.
+
+// Reports a physical button press (pressed = 1) or release (pressed = 0, with how long it was held) to the app.
+static void sim_button_event(uint8_t which, bool pressed, uint16_t held_ms) {
+    uint8_t pk[9] = {0x07, which, (uint8_t)(pressed ? 1 : 0)};
+    uint32_t ms = (uint32_t)(esp_timer_get_time() / 1000);
+    memcpy(pk + 3, &ms, 4);
+    memcpy(pk + 7, &held_ms, 2);
+    ble_notify(res_handle, res_sub, pk, sizeof pk);
+    ESP_LOGI(TAG, "sim: %s button %s", which == 1 ? "top" : "bottom", pressed ? "down" : "up");
+}
+
+// A physical press, reported once it has been let go: 0 none, 1 top button, 2 bottom button (roles follow the screen
+// orientation, as on the real instruments). Held 2 s the board goes to sleep, as usual.
+static uint8_t sim_poll() {
+    if (ota_active || !button_pressed()) return 0;
+    vTaskDelay(pdMS_TO_TICKS(30));   // debounce
+    bool t = btn_top_pressed(), b = btn_bottom_pressed();
+    if (!t && !b) return 0;
+    uint8_t which = (t && !b) ? 1 : 2;
+    btn_seen = button_mask();
+    btn_note(btn_seen);
+    sim_button_event(which, true, 0);
+    int64_t t0 = esp_timer_get_time();
+    btn_short_press();   // waits for the release
+    sim_button_event(which, false, (uint16_t)((esp_timer_get_time() - t0) / 1000));
+    return which;
+}
+
+// A plausible white-LED spectrum, 1 nm steps, peak about 1: variants 0 warm, 1 neutral, 2 cool, with a little noise.
+static void sim_fill_scan(int lo, int hi, int variant, float exposure_ms) {
+    static uint32_t seed = 0x1234567;
+    static const float P[3][6] = {
+        {450, 11, 0.55f, 610, 58, 1.00f},    // warm
+        {452, 11, 0.80f, 590, 55, 0.90f},    // neutral
+        {450, 10, 1.00f, 565, 52, 0.62f},    // cool
+    };
+    const float *v = P[((variant % 3) + 3) % 3];
+    int n = hi - lo + 1;
+    if (n > NPTS_MAX) n = NPTS_MAX;
+    scan.status = 0;
+    scan.exposure_ms = exposure_ms;
+    scan.npts = n;
+    scan.start_nm = lo;
+    for (int i = 0; i < n; i++) {
+        float nm = (float)(lo + i);
+        float b = (nm - v[0]) / v[1], p = (nm - v[3]) / v[4];
+        seed = seed * 1664525u + 1013904223u;
+        float noise = (((seed >> 16) & 0xFFFF) / 65535.0f - 0.5f) * 0.006f;
+        float y = v[2] * expf(-0.5f * b * b) + v[5] * expf(-0.5f * p * p) + noise;
+        scan.spd[i] = y > 0 ? y : 0;
+    }
+}
+
+static uint16_t sim_cal_age() { return sim_dark ? (uint16_t)((esp_timer_get_time() - sim_dark_us) / 60000000) : 0xFFFF; }
+static uint8_t sim_mk_flags() {
+    return (uint8_t)((mk_dial <= 3 ? (0x80 | mk_dial) : 0) | (sim_dark ? 0x04 : 0) | 0x40);   // 0x40: spectrum already corrected
+}
+
+// Torch Bearer: READY, SCAN (bottom button or phone), LIVE (top button or phone; any press or the phone stops it).
+static void sim_tb_step(int &variant) {
+    uint8_t b = sim_poll();
+    bool live = ble_live_req || b == 1;
+    bool scanning = ble_scan_req || b == 2;
+    if (ble_resend_req) { ble_resend_req = false; ble_send_result(); }
+    if (live) {
+        scan_started_us = ble_live_req ? ble_scan_req_us : esp_timer_get_time();
+        ble_live_req = false;
+        ble_scan_req = false;
+        ui_scanning();
+        ble_status(1, 0, 0);
+        int n = 0;
+        while (sim_kind == 1 && !sim_changed && !scan_cancelled() && !ota_active) {
+            ui_progress(n + 1, 14.0f, 0);
+            for (int i = 0; i < 6 && !scan_cancelled(); i++) vTaskDelay(pdMS_TO_TICKS(100));
+            sim_fill_scan(340, 1000, variant, 14.0f);
+            have_result = true;
+            ble_status(2, 0, scan.exposure_ms);
+            ble_send_result();
+            n++;
+            if (sim_poll()) break;
+        }
+        have_result = scan.npts > 0;
+        ui_result(true);
+        ble_status(0, 0, scan.exposure_ms);
+        ble_scan_req = false;
+    } else if (scanning) {
+        ble_scan_req = false;
+        ui_progress(1, 8.0f, 1);
+        vTaskDelay(pdMS_TO_TICKS(450));
+        ui_progress(2, 16.0f, 2);
+        vTaskDelay(pdMS_TO_TICKS(450));
+        ui_progress(3, 12.5f, 0);
+        vTaskDelay(pdMS_TO_TICKS(450));
+        sim_fill_scan(340, 1000, variant++, 12.5f);
+        have_result = true;
+        ui_result(true);
+        ble_status(2, 0, scan.exposure_ms);
+        ble_send_result();
+    }
+}
+
+// ColorMunki: the top button turns the "dial" (calibration, ambient, surface, projector); the bottom button or the phone
+// does what the real button does at that dial position.
+static void sim_mk_action(int &variant) {
+    mk_msg = "";
+    if (mk_dial == munki::POS_CALIB) {
+        ble_status(1, 0, 0);
+        ui_munki_busy("CALIBRATING...");
+        vTaskDelay(pdMS_TO_TICKS(1500));
+        sim_dark = true;
+        sim_dark_us = esp_timer_get_time();
+        meter_flags = sim_mk_flags();
+        ble_status(0, 0, 0);
+        ui_munki_ready();
+    } else if (mk_dial == munki::POS_AMBIENT) {
+        if (!sim_dark) { mk_fail(MKR_NO_DARK, "CALIBRATE FIRST (DIAL TO CALIBRATION)"); return; }
+        ble_status(1, 0, 0);
+        ui_munki_busy("MEASURING...");
+        vTaskDelay(pdMS_TO_TICKS(1500));
+        sim_fill_scan(380, 730, variant++, 20.0f);
+        have_result = true;
+        ui_result(true);
+        ble_status(2, 0, scan.exposure_ms);
+        ble_send_result();
+    } else {
+        mk_fail(MKR_WRONG_DIAL, "SET THE DIAL TO AMBIENT (OR CALIBRATION)");
+    }
+    meter_flags = sim_mk_flags();
+    ble_status_refresh();
+}
+
+static void sim_mk_step(int &variant) {
+    uint8_t b = sim_poll();
+    if (ble_resend_req) { ble_resend_req = false; ble_send_result(); }
+    if (b == 1) {
+        static const uint8_t ORDER[4] = {munki::POS_CALIB, munki::POS_AMBIENT, munki::POS_SURF, munki::POS_PROJ};
+        int i = 0;
+        for (int k = 0; k < 4; k++) if (ORDER[k] == mk_dial) i = k;
+        mk_dial = ORDER[(i + 1) % 4];
+        mk_msg = "";
+        meter_flags = sim_mk_flags();
+        ble_status_refresh();
+        ui_munki_ready();
+    } else if (b == 2 || ble_scan_req) {
+        ble_scan_req = false;
+        sim_mk_action(variant);
+    }
+}
+
+// TKLamp tester: the bottom button steps forward through five lumen magnitudes, then WAITING FOR DATA and NO DATA; the
+// top button steps back. The lumen readings drift a little and go to the phone as live packets (06), like the real tester.
+static const float SIM_TK_LM[5] = {0.8f, 42.0f, 635.0f, 2480.0f, 18500.0f};
+static void sim_tk_draw(int st, float lm) {
+    if (st < 5) ui_tk(lm, true, false);
+    else if (st == 5) ui_tk(0, false, false);
+    else ui_tk(0, false, true);
+}
+static void sim_tk_step(int &st, int64_t &last_us) {
+    uint8_t b = sim_poll();
+    int64_t now = esp_timer_get_time();
+    if (b) {
+        st = b == 2 ? (st + 1) % 7 : (st + 6) % 7;
+        sim_tk_draw(st, st < 5 ? SIM_TK_LM[st] : 0);
+        last_us = now;
+    }
+    if (st < 5 && now - last_us >= 220000) {
+        last_us = now;
+        static uint32_t seed = 99;
+        seed = seed * 1664525u + 1013904223u;
+        float lm = SIM_TK_LM[st] * (1.0f + (((seed >> 16) & 0xFFFF) / 65535.0f - 0.5f) * 0.02f);
+        uint8_t pk[9] = {0x06};
+        uint32_t ms = (uint32_t)(now / 1000), raw = (uint32_t)(lm * TK_RAW_PER_LM);
+        memcpy(pk + 1, &ms, 4);
+        memcpy(pk + 5, &raw, 4);
+        ble_notify(res_handle, res_sub, pk, sizeof pk);
+        static int64_t drawn = 0;
+        if (now - drawn > 300000) { drawn = now; ui_tk(lm, true, false); }
+    }
+    ble_scan_req = false;
+    ble_resend_req = false;
+}
+
+// Runs the simulated instrument until the simulation is changed or turned off.
+static void sim_session() {
+    uint8_t kind = sim_kind;
+    sim_changed = false;
+    sim_redraw = false;
+    ble_scan_req = ble_live_req = ble_resend_req = false;
+    have_result = false;
+    int variant = 0, tk_state = 0;
+    int64_t tk_last = 0;
+    ESP_LOGI(TAG, "simulating instrument %d", kind);
+    if (kind == 1) {
+        meter_kind = 0;
+        strncpy(device_id, "SIMULATED TORCH BEARER", sizeof device_id);
+        range_lo = 340;
+        range_hi = 1000;
+        adv_set_attached(1);
+        ble_status(0, 0, 0);
+        ui_ready();
+    } else if (kind == 2) {
+        meter_kind = 1;
+        strncpy(device_id, "COLORMUNKI", sizeof device_id);
+        range_lo = 380;
+        range_hi = 730;
+        sim_dark = false;
+        mk_dial = munki::POS_CALIB;
+        mk_msg = "";
+        meter_cal_age_min = sim_cal_age;
+        meter_flags = sim_mk_flags();
+        adv_set_attached(2);
+        ble_status(0, 0, 0);
+        ui_munki_ready();
+    } else {
+        meter_kind = 2;
+        strncpy(device_id, "TKLAMP", sizeof device_id);
+        adv_set_attached(3);
+        ble_status(0, 0, 0);
+        sim_tk_draw(0, SIM_TK_LM[0]);
+    }
+    while (sim_kind == kind && !sim_changed) {
+        if (ota_active) { vTaskDelay(pdMS_TO_TICKS(100)); continue; }
+        if (sim_redraw) {
+            sim_redraw = false;
+            if (kind == 1) ui_ready(); else if (kind == 2) ui_munki_ready(); else sim_tk_draw(tk_state, tk_state < 5 ? SIM_TK_LM[tk_state] : 0);
+        }
+        if (kind == 1) sim_tb_step(variant);
+        else if (kind == 2) sim_mk_step(variant);
+        else sim_tk_step(tk_state, tk_last);
+        flip_tick();
+        btn_tick();
+        battery_tick();
+        link_tick();
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    meter_kind = 0;
+    meter_cal_age_min = NULL;
+    meter_flags = 0;
+    device_id[0] = 0;
+    range_lo = 340;
+    range_hi = 1000;
+    have_result = false;
+    ble_scan_req = ble_live_req = false;
+    sim_dark = false;
+}
+
 extern "C" void app_main() {
     // Coming back from deep sleep: the pins held during the sleep (backlight, power enable) and the button pins the RTC
     // domain was watching go back to normal use.
@@ -2511,7 +2786,14 @@ extern "C" void app_main() {
     while (true) {
         // 1. wait for the spectrometer (or a ColorMunki)
         while (!usb_connected) {
-            if (mk_try_open()) {
+            if (sim_kind) {
+                sim_session();   // developer simulation (BLE command 07): ignores real instruments until turned off
+                if (!sim_kind) {
+                    adv_set_attached(0);
+                    ui_waiting();
+                    ble_status(3, 0, 0);
+                }
+            } else if (mk_try_open()) {
                 mk_session();
                 adv_set_attached(0);
                 ui_waiting();

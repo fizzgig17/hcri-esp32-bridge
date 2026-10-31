@@ -114,7 +114,8 @@ one USB flash.)
 
 ## Bluetooth (BLE) trigger
 Advertises as "hCRI Bridge" (firmware before October 14, 2026 advertised "Torch Bearer"; the app accepts both). Service 7a1c0001-5b2e-4f0a-9c3d-2e8f6b4a1d00:
-- 7a1c0002-... command (write): 01 = scan now, 02 = resend last result, 06 = live (Torch Bearer only: keep scanning and send every locked result until 05), 05 = cancel the reading in progress or stop live
+- 7a1c0002-... command (write): 01 = scan now, 02 = resend last result, 06 = live (Torch Bearer only: keep scanning and send every locked result until 05), 05 = cancel the reading in progress or stop live,
+  07 `<kind>` = developer simulation (see below)
 - 7a1c0003-... result (notify/read): summary packet, then the full spectrum in chunks
 - 7a1c0004-... status (notify/read): [state u8][try u8][exposure_ms f32]; state 0 ready, 1 scanning, 2 done, 3 error, 4 done-not-locked
 
@@ -132,6 +133,16 @@ Result packets (little-endian):
 - 7a1c0006-... info (read): `[1][flags: bit0 = can update over Bluetooth][board: 0 S3, 1 Pro][running slot][0]` then the git commit as text.
 
 Test with nRF Connect: connect, subscribe to result + status, write 01 to the command characteristic.
+
+### Simulating an instrument (developers)
+With nothing plugged in, write `07 <kind>` to the command characteristic (0 off, 1 Torch Bearer, 2 ColorMunki, 3 TKLamp tester).
+The board then advertises and behaves like that instrument, with made-up readings, so its screens can be worked on without the
+hardware. It is held in RAM only (a restart ends it), a plugged-in instrument is ignored while it is on, and the screen shows `SIM` after
+the firmware commit. Physical button presses do what they would on the real instrument and are also sent to the app as result packet
+`07 | button u8 (1 top, 2 bottom) | pressed u8 (1 down, 0 up) | ms u32 | held_ms u16`. Buttons in each simulation: Torch Bearer top = LIVE,
+bottom = SCAN; ColorMunki top = turn the dial (calibration, ambient, surface, projector), bottom = calibrate / measure; TKLamp bottom = next
+state (five lumen magnitudes, WAITING FOR DATA, NO DATA), top = previous. The hCRI Companion dev builds have a switch for it in Settings.
+
 
 ## Spectral correction and on-board colorimetry
 
