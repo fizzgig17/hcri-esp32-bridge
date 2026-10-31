@@ -2757,9 +2757,9 @@ static void sim_mk_step(int &variant) {
     }
 }
 
-// TKLamp tester: the bottom button steps forward through five lumen magnitudes, then WAITING FOR DATA and NO DATA; the
+// TKLamp tester: the bottom button steps forward through five flashlight-like levels (moonlight to turbo), then WAITING FOR DATA and NO DATA; the
 // top button is the app's run Start / Stop. The lumen readings drift a little and go to the phone as live packets (06), like the real tester.
-static const float SIM_TK_LM[5] = {0.8f, 42.0f, 635.0f, 2480.0f, 18500.0f};
+static const float SIM_TK_LM[5] = {1.5f, 14.2f, 118.0f, 540.0f, 1250.0f};
 static void sim_tk_draw(int st, float lm) {
     if (st < 5) ui_tk(lm, true, false);
     else if (st == 5) ui_tk(0, false, false);

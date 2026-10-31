@@ -143,7 +143,7 @@ hardware. It is held in RAM only (a restart or a phone disconnect ends it), a pl
 the firmware commit. Physical button presses do what they would on the real instrument and are also sent to the app as result packet
 `07 | button u8 (1 top, 2 bottom) | pressed u8 (1 down, 0 up) | ms u32 | held_ms u16`. Buttons in each simulation: Torch Bearer top = READ (one
 simulated reading, "SIMULATED READ"), bottom = LIVE (only announced: "SIMULATING LIVE READ, PRESS BUTTON AGAIN TO STOP"; nothing is measured); ColorMunki top = turn the dial (calibration, ambient, surface, projector), bottom = calibrate / measure; TKLamp bottom = next
-state (five lumen magnitudes, WAITING FOR DATA, NO DATA), top = start / stop of the run in the app. The hCRI Companion dev builds have a switch for it in Settings.
+state (five flashlight-like levels, WAITING FOR DATA, NO DATA), top = start / stop of the run in the app. The hCRI Companion dev builds have a switch for it in Settings.
 
 
 ## Spectral correction and on-board colorimetry
