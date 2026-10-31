@@ -135,7 +135,7 @@ Result packets (little-endian):
 Test with nRF Connect: connect, subscribe to result + status, write 01 to the command characteristic.
 
 Result packet `08 01` (Torch Bearer): Live was started with the bridge's own button (not by the phone), so the app goes into Live as well; Live ends with the usual ready status. A simulated ColorMunki starts calibrated with the dial on Ambient. During Live the bottom button's label reads STOP.
-Command `09 <1 top|2 bottom>` (simulation only): the phone presses a bridge button, handled exactly like the physical one. Command `0A <0|1>` (simulated TKLamp): the app has a run going, so the screen reads RECORDING RUN and the top button is STOP (the level button keeps working). The TKLamp screen labels the top button START (STOP during a run) and the bottom one NEXT.
+Command `09 <1 top|2 bottom>` (simulation only): the phone presses a bridge button, handled exactly like the physical one. Command `0A <0|1>` (simulated TKLamp): the app has a run going, so the screen reads RECORDING RUN and the top button is STOP (the level button keeps working). The TKLamp screen draws an arrow and a label at each button like the other testers: START (STOP during a run, with RECORDING RUN in red) on top, NEXT below.
 
 ### Simulating an instrument (developers)
 With nothing plugged in, write `07 <kind>` to the command characteristic (0 off, 1 Torch Bearer, 2 ColorMunki, 3 TKLamp tester).

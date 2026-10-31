@@ -2530,15 +2530,14 @@ static void ui_tk(float lm, bool have, bool stale) {
         char s[16];
         snprintf(s, sizeof s, lm >= 100.0f ? "%.0f" : "%.1f", lm);   // like the app: one decimal below 100 lm
         int w = (int)strlen(s) * 36;
-        const int ny = sim_kind == 3 ? 28 : 52;   // the simulator needs room under the number for what the buttons do
-        text((W - w) / 2, ny, s, 6, WHITE);
-        text(W / 2 - 12, ny + 52, "LM", 2, GREY);
+        text((W - w) / 2, 52, s, 6, WHITE);
+        text(W / 2 - 12, 104, "LM", 2, GREY);
     } else {
         text(20 + lpad(), 70, stale ? "TESTER STOPPED SENDING" : "WAITING FOR DATA", 2, YELLOW);
     }
-    if (sim_kind == 3) {   // what the two buttons do (the arrows point at them)
-        text(6 + lpad(), 100, sim_tk_run ? "RECORDING RUN - PRESS TOP TO STOP" : "PRESS TOP BUTTON TO START A RUN", 1, sim_tk_run ? RED : YELLOW);
-        text(6 + lpad(), 110, "PRESS BOTTOM BUTTON FOR NEXT LEVEL", 1, YELLOW);
+    if (sim_kind == 3) {   // the two buttons: an arrow and a label each, like the other testers (START / STOP on top, NEXT below)
+        if (sim_tk_run) text(6 + lpad(), 104, "RECORDING RUN", 1, RED);
+        draw_btn_arrow();
     }
     draw_btn_note();
     textf(6 + lpad(), 160, 1, GREY, "FW %s", fw_label());   // clear of the button arrow on its side
