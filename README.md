@@ -135,6 +135,7 @@ Result packets (little-endian):
 Test with nRF Connect: connect, subscribe to result + status, write 01 to the command characteristic.
 
 Result packet `08 01` (Torch Bearer): Live was started with the bridge's own button (not by the phone), so the app goes into Live as well; Live ends with the usual ready status. A simulated ColorMunki starts calibrated with the dial on Ambient. During Live the bottom button's label reads STOP.
+Command `09 <1 top|2 bottom>` (simulation only): the phone presses a bridge button, handled exactly like the physical one. Command `0A <0|1>` (simulated TKLamp): the app has a run going, so the screen offers only STOP and the level button is ignored until it ends. The TKLamp screen labels the top button START (STOP during a run) and the bottom one NEXT.
 
 ### Simulating an instrument (developers)
 With nothing plugged in, write `07 <kind>` to the command characteristic (0 off, 1 Torch Bearer, 2 ColorMunki, 3 TKLamp tester).
@@ -143,7 +144,7 @@ hardware. It is held in RAM only (a restart or a phone disconnect ends it), a pl
 the firmware commit. Physical button presses do what they would on the real instrument and are also sent to the app as result packet
 `07 | button u8 (1 top, 2 bottom) | pressed u8 (1 down, 0 up) | ms u32 | held_ms u16`. Buttons in each simulation: Torch Bearer top = READ (one
 simulated reading, "SIMULATED READ"), bottom = LIVE (only announced: "SIMULATING LIVE READ, PRESS BUTTON AGAIN TO STOP"; nothing is measured); ColorMunki top = turn the dial (calibration, ambient, surface, projector), bottom = calibrate / measure; TKLamp bottom = next
-state (five flashlight-like levels, WAITING FOR DATA, NO DATA), top = start / stop of the run in the app. The hCRI Companion dev builds have a switch for it in Settings.
+state (five flashlight-like levels, WAITING FOR DATA, NO DATA), top = start / stop of the run in the app (the screen then shows only STOP until the run ends). The hCRI Companion dev builds have a switch for it in Settings.
 
 
 ## Spectral correction and on-board colorimetry

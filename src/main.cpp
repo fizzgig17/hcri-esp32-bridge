@@ -890,6 +890,8 @@ static volatile bool ble_scan_req = false;
 static volatile bool ble_resend_req = false;
 static volatile bool ble_live_req = false;   // command 06: keep scanning until cancelled (05)
 // Developer simulation (command 07): which instrument to pretend is attached when none is plugged in.
+static volatile bool sim_tk_run = false;      // simulated TKLamp: the app has a run going (command 0A 01), so only STOP is offered
+static volatile uint8_t sim_inject = 0;      // simulation: a button press sent by the phone (command 09 <1 top|2 bottom>), taken by sim_poll()
 static volatile uint8_t sim_kind = 0;        // 0 off, 1 Torch Bearer, 2 ColorMunki, 3 TKLamp tester
 static volatile bool sim_changed = false;    // command 07 arrived: restart the simulated instrument
 static volatile bool sim_redraw = false;     // a firmware update ended: redraw the simulated screen
@@ -1085,7 +1087,7 @@ static int ble_gap_cb(struct ble_gap_event *ev, void *) {
     case BLE_GAP_EVENT_DISCONNECT:
         ble_conn = BLE_HS_CONN_HANDLE_NONE;
         res_sub = sta_sub = ota_sub = false;
-        if (sim_kind) { sim_kind = 0; sim_changed = true; }   // a simulation lasts only as long as the phone link
+        if (sim_kind) { sim_kind = 0; sim_tk_run = false; sim_changed = true; }   // a simulation lasts only as long as the phone link
         if (ota_active) { ota_abort_quiet(); ESP_LOGW(TAG, "update cancelled: phone disconnected"); }
         ble_advertise();
         break;
@@ -1307,6 +1309,14 @@ static int ble_access_cb(uint16_t, uint16_t, struct ble_gatt_access_ctxt *ctxt, 
                 uint8_t v = 0;
                 if (OS_MBUF_PKTLEN(ctxt->om) >= 2 && os_mbuf_copydata(ctxt->om, 1, 1, &v) == 0) { sim_kind = v <= 3 ? v : 0; sim_changed = true; }
             }
+            if (cmd == 0x0A) {  // 0x0A <0|1>: the app has a TKLamp run going (simulation only): the screen then offers only STOP
+                uint8_t v = 0;
+                if (OS_MBUF_PKTLEN(ctxt->om) >= 2 && os_mbuf_copydata(ctxt->om, 1, 1, &v) == 0) { sim_tk_run = v != 0; sim_redraw = true; }
+            }
+            if (cmd == 0x09) {  // 0x09 <1 top|2 bottom>: a button press from the phone (simulation only)
+                uint8_t w = 0;
+                if (sim_kind != 0 && OS_MBUF_PKTLEN(ctxt->om) >= 2 && os_mbuf_copydata(ctxt->om, 1, 1, &w) == 0 && (w == 1 || w == 2)) sim_inject = w;
+            }
             if (cmd == 0x08) { ESP_LOGW(TAG, "restart requested over BLE"); esp_restart(); }   // 0x08: reset the bridge
             if (cmd == 0x03) {  // 0x03 <0|1>: display orientation, 1 = turned 180 degrees
                 uint8_t v = 0;
@@ -1445,6 +1455,19 @@ static void draw_tb_buttons() {
     const bool live = !munki && (sim_live_banner || prog_mode == 2);   // during Live only the bottom button matters, and it stops it
     const int cx = left ? 8 : 312;
     const int lx = left ? 1 : W - 25;
+    if (tk) {   // top: START, or STOP while a run is going (then it is the only button offered); bottom: NEXT light level
+        const char *tl = sim_tk_run ? "STOP" : "START";
+        const int tx = left ? 1 : W - 1 - (int)strlen(tl) * 6;
+        for (int i = 0; i <= 5; i++) fill(cx - i, 3 + i, 2 * i + 1, 1, sim_tk_run ? RED : YELLOW);
+        fill(cx - 1, 9, 3, 8, sim_tk_run ? RED : YELLOW);
+        text(tx, 26, tl, 1, sim_tk_run ? RED : WHITE);
+        if (!sim_tk_run) {
+            for (int i = 0; i <= 5; i++) fill(cx - i, 166 - i, 2 * i + 1, 1, YELLOW);
+            fill(cx - 1, 153, 3, 8, YELLOW);
+            text(left ? 1 : W - 25, 142, "NEXT", 1, WHITE);
+        }
+        return;
+    }
     if (!live && (!munki || sim_kind == 2 || tk)) {
         for (int i = 0; i <= 5; i++) fill(cx - i, 3 + i, 2 * i + 1, 1, YELLOW);     // up arrow, tip at the top
         fill(cx - 1, 9, 3, 8, YELLOW);
@@ -2507,6 +2530,10 @@ static void ui_tk(float lm, bool have, bool stale) {
     } else {
         text(20 + lpad(), 70, stale ? "TESTER STOPPED SENDING" : "WAITING FOR DATA", 2, YELLOW);
     }
+    if (sim_kind == 3) {   // what the two buttons do (the arrows point at them)
+        text(6 + lpad(), 108, sim_tk_run ? "TOP: STOP RUN" : "TOP: START RUN", 1, sim_tk_run ? RED : YELLOW);
+        if (!sim_tk_run) text(6 + lpad(), 120, "BOTTOM: NEXT LEVEL", 1, YELLOW);
+    }
     draw_btn_note();
     textf(6, 160, 1, GREY, "FW %s", fw_label());
     diag_on = true;
@@ -2593,6 +2620,14 @@ static void sim_button_event(uint8_t which, bool pressed, uint16_t held_ms) {
 // A physical press, reported once it has been let go: 0 none, 1 top button, 2 bottom button (roles follow the screen
 // orientation, as on the real instruments). Held 2 s the board goes to sleep, as usual.
 static uint8_t sim_poll() {
+    if (!ota_active && sim_inject) {   // pressed from the phone: handled exactly like the physical button, including the press / release reports
+        uint8_t w = sim_inject;
+        sim_inject = 0;
+        sim_button_event(w, true, 0);
+        vTaskDelay(pdMS_TO_TICKS(80));
+        sim_button_event(w, false, 80);
+        return w;
+    }
     if (ota_active || !button_pressed()) return 0;
     vTaskDelay(pdMS_TO_TICKS(30));   // debounce
     bool t = btn_top_pressed(), b = btn_bottom_pressed();
@@ -2771,7 +2806,7 @@ static void sim_tk_step(int &st, int64_t &last_us) {
     uint8_t b = sim_poll();
     int64_t now = esp_timer_get_time();
     if (b) {
-        if (b == 2) st = (st + 1) % 7;   // the top button is the run's Start / Stop in the app (nothing to change here)
+        if (b == 2 && !sim_tk_run) st = (st + 1) % 7;   // the top button is the run's Start / Stop in the app (nothing to change here); no level changes during a run
         sim_tk_draw(st, st < 5 ? SIM_TK_LM[st] : 0);
         last_us = now;
     }
