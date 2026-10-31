@@ -555,7 +555,8 @@ static void draw_battery() {
 static bool diag_on = false;
 static void draw_diag() {
     // Stops above the flipped button arrow, and clear of the LIVE label on the button side of the Torch Bearer screens.
-    const int x0 = (tb_ui && arrow_bottom_left()) ? 28 : 0, x1 = (tb_ui && !arrow_bottom_left()) ? W - 28 : W;
+    const bool lbl = tb_ui || arrow_label;
+    const int x0 = (lbl && arrow_bottom_left()) ? 28 : 0, x1 = (lbl && !arrow_bottom_left()) ? W - 28 : W;
     fill(x0, 134, x1 - x0, 19, BLACK);
     if (dbg_stat < 0) return;
     char d[40];
