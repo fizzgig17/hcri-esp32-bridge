@@ -2805,7 +2805,10 @@ static void sim_tk_step(int &st, int64_t &last_us) {
     uint8_t b = sim_poll();
     int64_t now = esp_timer_get_time();
     if (b) {
-        if (b == 2) st = (st + 1) % 7;   // the top button is the run's Start / Stop in the app (nothing to change here); the level can change during a run too
+        if (b == 2) {
+            st = (st + 1) % 7;
+            if (sim_tk_run && st >= 5) st = 0;   // during a run only the five light levels: WAITING / NO DATA would make the run stop itself
+        }   // the top button is the run's Start / Stop in the app (nothing to change here); the level can change during a run too
         sim_tk_draw(st, st < 5 ? SIM_TK_LM[st] : 0);
         last_us = now;
     }
