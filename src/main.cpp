@@ -1440,18 +1440,19 @@ static void link_tick() {
 static int lpad() { return ((tb_ui || arrow_label) && arrow_bottom_left()) ? 24 : 0; }
 static void draw_tb_buttons() {
     const bool left = arrow_bottom_left();
-    const bool munki = arrow_label;                          // ColorMunki screen: bottom button reads, top turns the (simulated) dial
+    const bool tk = arrow_label && sim_kind == 3;            // simulated TKLamp: top starts / stops the run in the app, bottom steps the light level
+    const bool munki = arrow_label && !tk;                   // ColorMunki screen: bottom button reads, top turns the (simulated) dial
     const bool live = !munki && (sim_live_banner || prog_mode == 2);   // during Live only the bottom button matters, and it stops it
     const int cx = left ? 8 : 312;
     const int lx = left ? 1 : W - 25;
-    if (!live && (!munki || sim_kind == 2)) {
+    if (!live && (!munki || sim_kind == 2 || tk)) {
         for (int i = 0; i <= 5; i++) fill(cx - i, 3 + i, 2 * i + 1, 1, YELLOW);     // up arrow, tip at the top
         fill(cx - 1, 9, 3, 8, YELLOW);
-        text(lx, 26, munki ? "DIAL" : "READ", 1, WHITE);
+        text(lx, 26, tk ? "RUN" : munki ? "DIAL" : "READ", 1, WHITE);
     }
     for (int i = 0; i <= 5; i++) fill(cx - i, 166 - i, 2 * i + 1, 1, YELLOW);   // down arrow, tip at the bottom
     fill(cx - 1, 153, 3, 8, YELLOW);
-    text(lx, 142, munki ? "READ" : live ? "STOP" : "LIVE", 1, live ? RED : WHITE);
+    text(lx, 142, tk ? "NEXT" : munki ? "READ" : live ? "STOP" : "LIVE", 1, live ? RED : WHITE);
 }
 
 static void draw_btn_arrow() {
@@ -2495,6 +2496,7 @@ static bool tk_probe() {
 
 static void ui_tk(float lm, bool have, bool stale) {
     clear();
+    if (sim_kind == 3) arrow_label = true;   // simulated tester: the RUN / NEXT button labels are drawn
     header(stale ? "NO DATA" : "LIVE", stale ? RED : GREEN);
     if (have && !stale) {
         char s[16];
@@ -2503,7 +2505,7 @@ static void ui_tk(float lm, bool have, bool stale) {
         text((W - w) / 2, 52, s, 6, WHITE);
         text(W / 2 - 12, 104, "LM", 2, GREY);
     } else {
-        text(20, 70, stale ? "TESTER STOPPED SENDING" : "WAITING FOR DATA", 2, YELLOW);
+        text(20 + lpad(), 70, stale ? "TESTER STOPPED SENDING" : "WAITING FOR DATA", 2, YELLOW);
     }
     draw_btn_note();
     textf(6, 160, 1, GREY, "FW %s", fw_label());
@@ -2797,7 +2799,7 @@ static void sim_session() {
     sim_redraw = false;
     ble_scan_req = ble_live_req = ble_resend_req = false;
     have_result = false;
-    int variant = 0, tk_state = 0;
+    int variant = 0, tk_state = 3;   // TKLamp sim starts at a normal high flashlight level (540 lm)
     int64_t tk_last = 0;
     ESP_LOGI(TAG, "simulating instrument %d", kind);
     if (kind == 1) {
@@ -2827,7 +2829,7 @@ static void sim_session() {
         strncpy(device_id, "TKLAMP", sizeof device_id);
         adv_set_attached(3);
         ble_status(0, 0, 0);
-        sim_tk_draw(0, SIM_TK_LM[0]);
+        sim_tk_draw(3, SIM_TK_LM[3]);
     }
     while (sim_kind == kind && !sim_changed) {
         if (ota_active) { vTaskDelay(pdMS_TO_TICKS(100)); continue; }
