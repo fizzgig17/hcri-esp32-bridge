@@ -320,7 +320,12 @@ static void present() {
 static int shown = 0;      // which screen is on show: 1 READY, 2 result (both carry the button arrow); 0 any other
 static bool result_ok = true;  // the result screen's "ok", to redraw it after a flip
 static bool waiting_shown = false;  // the NO USB screen is on show
-static void clear() { memset(fb, 0, W * H * 2); shown = 0; waiting_shown = false; }
+// Torch Bearer screens on the Pro carry a READ arrow (top button) and a LIVE arrow (bottom button) on the button side; while
+// this is set the text steps clear of them. clear() drops it, and the Torch Bearer screens raise it again.
+static bool tb_ui = false;
+// What the progress screen says: 0 plain, 1 "PERFORMING READ", 2 "PERFORMING LIVE READ", 3 "SIMULATED READ".
+static int prog_mode = 0;
+static void clear() { memset(fb, 0, W * H * 2); shown = 0; waiting_shown = false; tb_ui = false; }
 
 static inline void px(int x, int y, uint16_t c) {
     if (x >= 0 && x < W && y >= 0 && y < H) fb[y * W + x] = c;
@@ -1072,6 +1077,7 @@ static int ble_gap_cb(struct ble_gap_event *ev, void *) {
     case BLE_GAP_EVENT_DISCONNECT:
         ble_conn = BLE_HS_CONN_HANDLE_NONE;
         res_sub = sta_sub = ota_sub = false;
+        if (sim_kind) { sim_kind = 0; sim_changed = true; }   // a simulation lasts only as long as the phone link
         if (ota_active) { ota_abort_quiet(); ESP_LOGW(TAG, "update cancelled: phone disconnected"); }
         ble_advertise();
         break;
@@ -1293,6 +1299,7 @@ static int ble_access_cb(uint16_t, uint16_t, struct ble_gatt_access_ctxt *ctxt, 
                 uint8_t v = 0;
                 if (OS_MBUF_PKTLEN(ctxt->om) >= 2 && os_mbuf_copydata(ctxt->om, 1, 1, &v) == 0) { sim_kind = v <= 3 ? v : 0; sim_changed = true; }
             }
+            if (cmd == 0x08) { ESP_LOGW(TAG, "restart requested over BLE"); esp_restart(); }   // 0x08: reset the bridge
             if (cmd == 0x03) {  // 0x03 <0|1>: display orientation, 1 = turned 180 degrees
                 uint8_t v = 0;
                 if (OS_MBUF_PKTLEN(ctxt->om) >= 2 && os_mbuf_copydata(ctxt->om, 1, 1, &v) == 0) flip_req = v ? 1 : 0;
@@ -1394,15 +1401,16 @@ static void thick_line(int x0, int y0, int x1, int y1, int t, uint16_t c) {
 static void draw_app_link() {
     bool up = ble_conn != BLE_HS_CONN_HANDLE_NONE;
     link_shown = up;
-    fill(LINK_X, LINK_Y, LINK_W, LINK_H, BLACK);
+    const int dx = (tb_ui && !arrow_bottom_left()) ? -34 : 0;   // clear of the READ label when the buttons are on the right
+    fill(LINK_X + dx, LINK_Y, LINK_W, LINK_H, BLACK);
     if (!up) return;
-    const int x = 300, y = 27;  // rune, about 9 x 15
+    const int x = 300 + dx, y = 27;  // rune, about 9 x 15
     thick_line(x + 4, y, x + 4, y + 14, 2, CYAN);
     thick_line(x + 4, y, x + 8, y + 4, 2, CYAN);
     thick_line(x + 8, y + 4, x, y + 10, 2, CYAN);
     thick_line(x + 4, y + 14, x + 8, y + 10, 2, CYAN);
     thick_line(x + 8, y + 10, x, y + 4, 2, CYAN);
-    text(298, 45, "APP", 1, CYAN);
+    text(298 + dx, 45, "APP", 1, CYAN);
 }
 // Called from the idle loops: redraw only when the phone connects or disconnects.
 static void ota_restore_ui();
@@ -1420,8 +1428,24 @@ static void link_tick() {
 // at the top-right: S3 arrow pointing right, Pro arrow pointing up.
 static inline bool arrow_bottom_left() { return !flipped; }   // both boards now start with the buttons at the bottom-left
 
+// Pro, Torch Bearer: READ arrow at the top (top button, word under the arrow), LIVE arrow at the bottom (bottom button,
+// word above the arrow), on whichever side the buttons are for the current orientation.
+static int lpad() { return (tb_ui && arrow_bottom_left()) ? 24 : 0; }
+static void draw_tb_buttons() {
+    const bool left = arrow_bottom_left();
+    const int cx = left ? 8 : 312;
+    const int lx = left ? 1 : W - 25;
+    for (int i = 0; i <= 5; i++) fill(cx - i, 3 + i, 2 * i + 1, 1, YELLOW);     // up arrow, tip at the top
+    fill(cx - 1, 9, 3, 8, YELLOW);
+    text(lx, 26, "READ", 1, WHITE);
+    for (int i = 0; i <= 5; i++) fill(cx - i, 166 - i, 2 * i + 1, 1, YELLOW);   // down arrow, tip at the bottom
+    fill(cx - 1, 153, 3, 8, YELLOW);
+    text(lx, 142, "LIVE", 1, WHITE);
+}
+
 static void draw_btn_arrow() {
 #ifdef BOARD_PRO
+    if (tb_ui) { draw_tb_buttons(); return; }
     if (!arrow_bottom_left()) {
         const int cx = 312;
         for (int i = 0; i <= 5; i++) fill(cx - i, 3 + i, 2 * i + 1, 1, YELLOW);   // head, tip at the top
@@ -1475,8 +1499,8 @@ static void btn_note(uint32_t m) {
     ESP_LOGI(TAG, "button pressed: %s", btn_text);
 }
 static void draw_btn_note() {
-    fill(20, 122, 200, 9, BLACK);
-    if (btn_text[0]) text(20, 122, btn_text, 1, CYAN);
+    fill(20 + lpad(), 122, 200, 9, BLACK);
+    if (btn_text[0]) text(20 + lpad(), 122, btn_text, 1, CYAN);
 }
 
 // "FW <commit>", with SIM added while a simulated instrument is on, so a simulation is never mistaken for a real one.
@@ -1487,7 +1511,7 @@ static const char *fw_label() {
 }
 
 static void header(const char *right, uint16_t rc) {
-    text(6, 4, meter_kind == 1 ? "COLORMUNKI" : meter_kind == 2 ? "TKLAMP" : hdr_generic ? "HCRI BRIDGE" : "TORCH BEARER", 2, WHITE);
+    text(6 + lpad(), 4, meter_kind == 1 ? "COLORMUNKI" : meter_kind == 2 ? "TKLAMP" : hdr_generic ? "HCRI BRIDGE" : "TORCH BEARER", 2, WHITE);
     // On the arrow screens the upright arrow owns the top-right corner, so the right-hand status steps left of it.
     int edge = (shown != 0 && !arrow_bottom_left()) ? W - 24 : W - 6;
     text(edge - (int)strlen(right) * 12, 4, right, 2, rc);
@@ -1517,14 +1541,18 @@ static void ui_ready() {
     if (meter_kind == 1) { ui_munki_ready(); return; }
     clear();
     shown = 1;
+#ifdef BOARD_PRO
+    tb_ui = true;
+#endif
+    const int L = lpad();
     header("READY", GREEN);
-    text(6, 32, device_id, 1, GREY);
-    textf(6, 48, 1, GREY, "RANGE %d-%d NM", range_lo, range_hi);
-    text(20, 78, "LIVE", 2, WHITE);       // top button; roles follow the screen: see btn_top_pressed()
-    text(20, 100, "SCAN", 2, WHITE);      // bottom button
+    text(L + 6, 32, device_id, 1, GREY);
+    textf(L + 6, 48, 1, GREY, "RANGE %d-%d NM", range_lo, range_hi);
+    text(L + 6, 74, "TOP BUTTON: READ", 2, WHITE);      // roles follow the screen: see btn_top_pressed()
+    text(L + 6, 98, "BOTTOM BUTTON: LIVE", 2, WHITE);
     draw_btn_note();
     draw_btn_arrow();
-    textf(arrow_bottom_left() ? 18 : 6, 160, 1, GREY, "FW %s", fw_label());
+    textf(arrow_bottom_left() ? (tb_ui ? 30 : 18) : 6, 160, 1, GREY, "FW %s", fw_label());
     diag_on = true;
     draw_diag();
     present();
@@ -1535,6 +1563,8 @@ static void ui_progress(int tries, float exp_ms, int status) {
     ble_status(1, (uint8_t)tries, exp_ms);
     clear();
     header("SCANNING", YELLOW);
+    if (prog_mode) text(6, 28, prog_mode == 1 ? "PERFORMING READ" : prog_mode == 2 ? "PERFORMING LIVE READ" : "SIMULATED READ", 2, CYAN);
+    if (prog_mode == 2) text(6, 146, "PRESS BUTTON AGAIN TO STOP", 1, YELLOW);
     textf(10, 50, 3, WHITE, "TRY %d", tries);
     textf(10, 90, 2, CYAN, "EXPOSURE %.1f MS", exp_ms);
     text(10, 115, status == 1 ? "TOO BRIGHT - ADJUSTING" : status == 2 ? "TOO DIM - ADJUSTING" : "OK", 2,
@@ -1588,27 +1618,31 @@ static void ui_result(bool ok) {
     Metrics m;
     bool have_m = compute_metrics(scan.spd, n, scan.start_nm, &m);
     clear();
+#ifdef BOARD_PRO
+    tb_ui = true;
+#endif
+    const int L = lpad();
     shown = 2;
     result_ok = ok;
     header(ok ? "DONE" : "NO LOCK", ok ? GREEN : RED);
 
     // colorimetry, computed on the board from the corrected spectrum
     if (have_m) {
-        textf(6, 28, 2, WHITE, "CCT %.0f K", m.cct);
-        textf(6, 46, 2, WHITE, "DUV %+.4f", m.duv);
-        textf(6, 64, 2, WHITE, "RA %d  R9 %d", m.ra, m.r9);
+        textf(L + 6, 28, 2, WHITE, "CCT %.0f K", m.cct);
+        textf(L + 6, 46, 2, WHITE, "DUV %+.4f", m.duv);
+        textf(L + 6, 64, 2, WHITE, "RA %d  R9 %d", m.ra, m.r9);
         textf(196, 30, 1, CYAN, "X %.4f", m.x);
         textf(196, 42, 1, CYAN, "Y %.4f", m.y);
     } else {
-        text(6, 40, "NO SIGNAL", 2, RED);
+        text(L + 6, 40, "NO SIGNAL", 2, RED);
     }
     textf(196, 54, 1, GREY, "PEAK %d NM", scan.start_nm + pk);
     textf(196, 66, 1, GREY, "EXP %.1f MS", scan.exposure_ms);
-    textf(6, 80, 1, scan.status == 0 ? GREY : YELLOW, "%s  %d PTS",
+    textf(L + 6, 80, 1, scan.status == 0 ? GREY : YELLOW, "%s  %d PTS",
           scan.status == 0 ? "NORMAL" : scan.status == 1 ? "OVER-EXPOSED" : "UNDER-EXPOSED", n);
 
     // spectrum plot, x = wavelength, y = value (autoscaled to the peak)
-    const int px0 = 10, pw = 300, py0 = 92, ph = 66;
+    const int px0 = 10 + L, pw = tb_ui ? 276 : 300, py0 = 92, ph = 66;
     for (int x = 0; x < pw; x++) px(px0 + x, py0 + ph, GREY);
     if (mx > 0 && n > 1) {
         for (int x = 0; x < pw; x++) {
@@ -1621,7 +1655,7 @@ static void ui_result(bool ok) {
         int pkx = pk * (pw - 1) / (n - 1);
         vline(px0 + pkx, py0, py0 + ph, YELLOW);
     }
-    textf(arrow_bottom_left() ? px0 + 8 : px0, 162, 1, GREY, "%d", range_lo);   // steps right of the flipped arrow
+    textf(arrow_bottom_left() && !tb_ui ? px0 + 8 : px0, 162, 1, GREY, "%d", range_lo);   // steps right of the flipped arrow
     draw_btn_arrow();
     if (btn_text[0]) text(196, 80, btn_text, 1, CYAN);
     textf(px0 + pw / 2 - 9, 162, 1, GREY, "%d", (range_lo + range_hi) / 2);
@@ -2567,47 +2601,51 @@ static uint8_t sim_mk_flags() {
     return (uint8_t)((mk_dial <= 3 ? (0x80 | mk_dial) : 0) | (sim_dark ? 0x04 : 0) | 0x40);   // 0x40: spectrum already corrected
 }
 
-// Torch Bearer: READY, SCAN (bottom button or phone), LIVE (top button or phone; any press or the phone stops it).
+// Torch Bearer: READY, READ (top button or phone: one simulated reading), LIVE (bottom button or phone: only announced,
+// nothing is measured; any press or the phone stops it).
+static void sim_tb_live_screen() {
+    diag_on = false;
+    clear();
+    header("SIM LIVE", YELLOW);
+    text(6, 44, "SIMULATING LIVE READ", 2, CYAN);
+    text(6, 88, "PRESS BUTTON AGAIN", 2, WHITE);
+    text(6, 108, "TO STOP", 2, WHITE);
+    present();
+}
 static void sim_tb_step(int &variant) {
     uint8_t b = sim_poll();
-    bool live = ble_live_req || b == 1;
-    bool scanning = ble_scan_req || b == 2;
+    bool live = ble_live_req || b == 2;
+    bool scanning = ble_scan_req || b == 1;
     if (ble_resend_req) { ble_resend_req = false; ble_send_result(); }
     if (live) {
         scan_started_us = ble_live_req ? ble_scan_req_us : esp_timer_get_time();
         ble_live_req = false;
         ble_scan_req = false;
-        ui_scanning();
+        sim_tb_live_screen();
         ble_status(1, 0, 0);
-        int n = 0;
         while (sim_kind == 1 && !sim_changed && !scan_cancelled() && !ota_active) {
-            ui_progress(n + 1, 14.0f, 0);
-            for (int i = 0; i < 6 && !scan_cancelled(); i++) vTaskDelay(pdMS_TO_TICKS(100));
-            sim_fill_scan(340, 1000, variant, 14.0f);
-            have_result = true;
-            ble_status(2, 0, scan.exposure_ms);
-            ble_send_result();
-            n++;
             if (sim_poll()) break;
+            vTaskDelay(pdMS_TO_TICKS(30));
         }
-        have_result = scan.npts > 0;
-        ui_result(true);
-        ble_status(0, 0, scan.exposure_ms);
-        ble_scan_req = false;
+        if (sim_kind == 1) { ui_ready(); ble_status(0, 0, 0); }
     } else if (scanning) {
         ble_scan_req = false;
+        prog_mode = 3;
         ui_progress(1, 8.0f, 1);
         vTaskDelay(pdMS_TO_TICKS(450));
         ui_progress(2, 16.0f, 2);
         vTaskDelay(pdMS_TO_TICKS(450));
         ui_progress(3, 12.5f, 0);
         vTaskDelay(pdMS_TO_TICKS(450));
+        prog_mode = 0;
         sim_fill_scan(340, 1000, variant++, 12.5f);
         have_result = true;
         ui_result(true);
         ble_status(2, 0, scan.exposure_ms);
         ble_send_result();
     }
+    ble_scan_req = false;
+    ble_resend_req = false;
 }
 
 // ColorMunki: the top button turns the "dial" (calibration, ambient, surface, projector); the bottom button or the phone
@@ -2753,6 +2791,7 @@ static void sim_session() {
     have_result = false;
     ble_scan_req = ble_live_req = false;
     sim_dark = false;
+    prog_mode = 0;
 }
 
 extern "C" void app_main() {
@@ -2834,8 +2873,8 @@ extern "C" void app_main() {
                 if (top || bottom) {
                     from_button = true;
                     btn_seen = button_mask(); btn_note(btn_seen);
-                    if (top && !bottom) live_from_button = true;   // top button: Live
-                    else trigger = true;                           // bottom button (or both): one scan
+                    if (bottom && !top) live_from_button = true;   // bottom button: Live
+                    else trigger = true;                           // top button (or both): one read
                 }
             }
             if (ble_resend_req) {
@@ -2852,9 +2891,11 @@ extern "C" void app_main() {
                 }
                 ble_live_req = false;
                 ble_scan_req = false;
+                prog_mode = 2;
                 ui_scanning();
                 ble_status(1, 0, 0);
                 int n = tb_live(ui_progress, tb_live_emit, tb_live_stop);
+                prog_mode = 0;
                 if (usb_lost) break;
                 ESP_LOGI(TAG, "live ended after %d results", n);
                 have_result = scan.npts > 0;
@@ -2865,8 +2906,10 @@ extern "C" void app_main() {
             }
             if (trigger) {
                 ble_scan_req = false;
+                prog_mode = 1;
                 ui_scanning();
                 bool ok = tb_scan(ui_progress, 40);
+                prog_mode = 0;
                 if (usb_lost) break;
                 have_result = ok || scan.npts > 0;
                 if (scan.npts > 0) apply_correction(scan.spd, scan.npts, scan.start_nm);  // HPCS-fitted, before display + BLE

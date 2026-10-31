@@ -137,10 +137,10 @@ Test with nRF Connect: connect, subscribe to result + status, write 01 to the co
 ### Simulating an instrument (developers)
 With nothing plugged in, write `07 <kind>` to the command characteristic (0 off, 1 Torch Bearer, 2 ColorMunki, 3 TKLamp tester).
 The board then advertises and behaves like that instrument, with made-up readings, so its screens can be worked on without the
-hardware. It is held in RAM only (a restart ends it), a plugged-in instrument is ignored while it is on, and the screen shows `SIM` after
+hardware. It is held in RAM only (a restart or a phone disconnect ends it), a plugged-in instrument is ignored while it is on, and the screen shows `SIM` after
 the firmware commit. Physical button presses do what they would on the real instrument and are also sent to the app as result packet
-`07 | button u8 (1 top, 2 bottom) | pressed u8 (1 down, 0 up) | ms u32 | held_ms u16`. Buttons in each simulation: Torch Bearer top = LIVE,
-bottom = SCAN; ColorMunki top = turn the dial (calibration, ambient, surface, projector), bottom = calibrate / measure; TKLamp bottom = next
+`07 | button u8 (1 top, 2 bottom) | pressed u8 (1 down, 0 up) | ms u32 | held_ms u16`. Buttons in each simulation: Torch Bearer top = READ (one
+simulated reading, "SIMULATED READ"), bottom = LIVE (only announced: "SIMULATING LIVE READ, PRESS BUTTON AGAIN TO STOP"; nothing is measured); ColorMunki top = turn the dial (calibration, ambient, surface, projector), bottom = calibrate / measure; TKLamp bottom = next
 state (five lumen magnitudes, WAITING FOR DATA, NO DATA), top = previous. The hCRI Companion dev builds have a switch for it in Settings.
 
 
@@ -201,7 +201,7 @@ GPLv3 (see `LICENSE`), derived from Torch-Bearer-Tools / tobes-ui. Copyright fiz
 
 ## Buttons and sleep
 
-- Torch Bearer: the top button (as seen on the screen) starts Live, the bottom button takes one scan; the roles swap when the display is flipped. Any press stops Live. A press acts when it is let go.
+- Torch Bearer: the top button (as seen on the screen) takes one READ (screen: PERFORMING READ), the bottom button starts LIVE (PERFORMING LIVE READ, PRESS BUTTON AGAIN TO STOP); on the S3 Pro an arrow and the word READ (top) and LIVE (bottom) mark the buttons on whichever side they are, and the text steps clear of them. The roles follow the screen when it is flipped. Any press stops Live. A press acts when it is let go.
 - Hold either button for 2 seconds to put the board into deep sleep (screen off; on the Pro the instrument power boost is cut). Press a wake button to start it again: both side buttons on the T-Display-S3 Pro, the GPIO 14 button on the T-Display S3 (BOOT is not used to wake it). It reboots, so the phone and instrument reconnect.
 
 _The firmware can be updated from the phone; the update path has been tested end to end on the T-Display S3 Pro._
