@@ -1548,7 +1548,12 @@ static void header(const char *right, uint16_t rc) {
     // On the arrow screens the upright arrow owns the top-right corner, so the right-hand status steps left of it.
     int edge = (shown != 0 && !arrow_bottom_left()) ? W - 24 : W - 6;
     const int rx = edge - (int)strlen(right) * 12;
-    if (rx < BATT_X + BATT_W + 4) text(edge - (int)strlen(right) * 6, 8, right, 1, rc);   // too wide beside the battery figure: small text instead of touching it
+#ifdef BOARD_PRO
+    const bool tight = rx < BATT_X + BATT_W + 4;   // the battery figure sits in the header on the Pro only
+#else
+    const bool tight = false;
+#endif
+    if (tight) text(edge - (int)strlen(right) * 6, 8, right, 1, rc);   // too wide beside the battery figure: small text instead of touching it
     else text(rx, 4, right, 2, rc);
     draw_battery();
     for (int x = 0; x < W; x++) px(x, 22, GREY);
