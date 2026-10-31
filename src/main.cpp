@@ -325,6 +325,8 @@ static bool waiting_shown = false;  // the NO USB screen is on show
 static bool tb_ui = false;
 // What the progress screen says: 0 plain, 1 "PERFORMING READ", 2 "PERFORMING LIVE READ", 3 "SIMULATED READ".
 static int prog_mode = 0;
+// While a simulated Live read runs, the result screen says so (header and the line under the figures).
+static bool sim_live_banner = false;
 static inline bool arrow_bottom_left() { return !flipped; }   // (declared early: the app link uses it) both boards now start with the buttons at the bottom-left
 static void clear() { memset(fb, 0, W * H * 2); shown = 0; waiting_shown = false; tb_ui = false; }
 
@@ -550,11 +552,13 @@ static void draw_battery() {
 // Power-chip state line on the idle screens (NO USB / READY): input status, charge state, fault flags, battery mV.
 static bool diag_on = false;
 static void draw_diag() {
-    fill(0, 134, W, 19, BLACK);   // stops above the flipped button arrow
+    // Stops above the flipped button arrow, and clear of the LIVE label on the button side of the Torch Bearer screens.
+    const int x0 = (tb_ui && arrow_bottom_left()) ? 28 : 0, x1 = (tb_ui && !arrow_bottom_left()) ? W - 28 : W;
+    fill(x0, 134, x1 - x0, 19, BLACK);
     if (dbg_stat < 0) return;
     char d[40];
     snprintf(d, sizeof d, "S%d C%d F%02X %dmV", dbg_stat, dbg_chrg, dbg_fault, dbg_mv);
-    text(20, 140, d, 2, GREY);
+    text(x0 + 20, 140, d, 2, GREY);
 }
 
 // Called from the idle loops: refresh the indicator (at most every 5 s) and redraw if it changed.
@@ -1624,7 +1628,7 @@ static void ui_result(bool ok) {
     const int L = lpad();
     shown = 2;
     result_ok = ok;
-    header(ok ? "DONE" : "NO LOCK", ok ? GREEN : RED);
+    if (sim_live_banner) header("SIM LIVE", YELLOW); else header(ok ? "DONE" : "NO LOCK", ok ? GREEN : RED);
 
     // colorimetry, computed on the board from the corrected spectrum
     if (have_m) {
@@ -1638,6 +1642,7 @@ static void ui_result(bool ok) {
     }
     textf(196, 54, 1, GREY, "PEAK %d NM", scan.start_nm + pk);
     textf(196, 66, 1, GREY, "EXP %.1f MS", scan.exposure_ms);
+    if (sim_live_banner) text(L + 6, 80, "SIMULATING LIVE READ - PRESS BUTTON AGAIN TO STOP", 1, YELLOW); else
     textf(L + 6, 80, 1, scan.status == 0 ? GREY : YELLOW, "%s  %d PTS",
           scan.status == 0 ? "NORMAL" : scan.status == 1 ? "OVER-EXPOSED" : "UNDER-EXPOSED", n);
 
@@ -1657,7 +1662,7 @@ static void ui_result(bool ok) {
     }
     textf(arrow_bottom_left() && !tb_ui ? px0 + 8 : px0, 162, 1, GREY, "%d", range_lo);   // steps right of the flipped arrow
     draw_btn_arrow();
-    if (btn_text[0]) text(196, 80, btn_text, 1, CYAN);
+    if (btn_text[0] && !sim_live_banner) text(196, 80, btn_text, 1, CYAN);
     textf(px0 + pw / 2 - 9, 162, 1, GREY, "%d", (range_lo + range_hi) / 2);
     textf(px0 + pw - 24, 162, 1, GREY, "%d", range_hi);
     present();
@@ -2608,16 +2613,7 @@ static uint8_t sim_mk_flags() {
 }
 
 // Torch Bearer: READY, READ (top button or phone: one simulated reading), LIVE (bottom button or phone: only announced,
-// nothing is measured; any press or the phone stops it).
-static void sim_tb_live_screen() {
-    diag_on = false;
-    clear();
-    header("SIM LIVE", YELLOW);
-    text(6, 44, "SIMULATING LIVE READ", 2, CYAN);
-    text(6, 88, "PRESS BUTTON AGAIN", 2, WHITE);
-    text(6, 108, "TO STOP", 2, WHITE);
-    present();
-}
+// only made-up readings are drawn; any press or the phone stops it).
 static void sim_tb_step(int &variant) {
     uint8_t b = sim_poll();
     bool live = ble_live_req || b == 2;
@@ -2627,12 +2623,22 @@ static void sim_tb_step(int &variant) {
         scan_started_us = ble_live_req ? ble_scan_req_us : esp_timer_get_time();
         ble_live_req = false;
         ble_scan_req = false;
-        sim_tb_live_screen();
         ble_status(1, 0, 0);
-        while (sim_kind == 1 && !sim_changed && !scan_cancelled() && !ota_active) {
-            if (sim_poll()) break;
-            vTaskDelay(pdMS_TO_TICKS(30));
+        // Made-up readings, one every 0.7 s, drawn like the real Live screen; nothing is sent to the app.
+        sim_live_banner = true;
+        int n = 0;
+        bool stop = false;
+        while (!stop && sim_kind == 1 && !sim_changed && !scan_cancelled() && !ota_active) {
+            sim_fill_scan(340, 1000, variant + n / 4, 14.0f);
+            have_result = true;
+            ui_result(true);
+            n++;
+            for (int i = 0; i < 23 && !stop && sim_kind == 1 && !sim_changed && !scan_cancelled(); i++) {
+                if (sim_poll()) stop = true;
+                else vTaskDelay(pdMS_TO_TICKS(30));
+            }
         }
+        sim_live_banner = false;
         if (sim_kind == 1) { ui_ready(); ble_status(0, 0, 0); }
     } else if (scanning) {
         ble_scan_req = false;
@@ -2798,6 +2804,7 @@ static void sim_session() {
     ble_scan_req = ble_live_req = false;
     sim_dark = false;
     prog_mode = 0;
+    sim_live_banner = false;
 }
 
 extern "C" void app_main() {
