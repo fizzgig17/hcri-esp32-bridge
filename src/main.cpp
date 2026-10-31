@@ -323,12 +323,14 @@ static bool waiting_shown = false;  // the NO USB screen is on show
 // Torch Bearer screens on the Pro carry a READ arrow (top button) and a LIVE arrow (bottom button) on the button side; while
 // this is set the text steps clear of them. clear() drops it, and the Torch Bearer screens raise it again.
 static bool tb_ui = false;
+// Pro, ColorMunki screens: a READ label by the single button arrow (cleared by clear() like tb_ui).
+static bool arrow_label = false;
 // What the progress screen says: 0 plain, 1 "PERFORMING READ", 2 "PERFORMING LIVE READ", 3 "SIMULATED READ".
 static int prog_mode = 0;
 // While a simulated Live read runs, the result screen says so (header and the line under the figures).
 static bool sim_live_banner = false;
 static inline bool arrow_bottom_left() { return !flipped; }   // (declared early: the app link uses it) both boards now start with the buttons at the bottom-left
-static void clear() { memset(fb, 0, W * H * 2); shown = 0; waiting_shown = false; tb_ui = false; }
+static void clear() { memset(fb, 0, W * H * 2); shown = 0; waiting_shown = false; tb_ui = false; arrow_label = false; }
 
 static inline void px(int x, int y, uint16_t c) {
     if (x >= 0 && x < W && y >= 0 && y < H) fb[y * W + x] = c;
@@ -1406,7 +1408,7 @@ static void thick_line(int x0, int y0, int x1, int y1, int t, uint16_t c) {
 static void draw_app_link() {
     bool up = ble_conn != BLE_HS_CONN_HANDLE_NONE;
     link_shown = up;
-    const int dx = (tb_ui && !arrow_bottom_left()) ? -34 : 0;   // clear of the READ label when the buttons are on the right
+    const int dx = ((tb_ui || arrow_label) && !arrow_bottom_left()) ? -34 : 0;   // clear of the READ label when the buttons are on the right
     fill(LINK_X + dx, LINK_Y, LINK_W, LINK_H, BLACK);
     if (!up) return;
     const int x = 300 + dx, y = 27;  // rune, about 9 x 15
@@ -1454,10 +1456,12 @@ static void draw_btn_arrow() {
         const int cx = 312;
         for (int i = 0; i <= 5; i++) fill(cx - i, 3 + i, 2 * i + 1, 1, YELLOW);   // head, tip at the top
         fill(cx - 1, 9, 3, 8, YELLOW);                                              // shaft
+        if (arrow_label) text(W - 25, 26, "READ", 1, WHITE);
     } else {
         const int cx = 8;
         for (int i = 0; i <= 5; i++) fill(cx - i, 166 - i, 2 * i + 1, 1, YELLOW); // head, tip at the bottom
         fill(cx - 1, 153, 3, 8, YELLOW);
+        if (arrow_label) text(1, 142, "READ", 1, WHITE);
     }
 #else
     if (!arrow_bottom_left()) {
@@ -2264,6 +2268,9 @@ static const char *mk_dial_name(uint8_t d) {
 static void ui_munki_ready() {
     clear();
     shown = 1;
+#ifdef BOARD_PRO
+    arrow_label = true;
+#endif
     header("READY", GREEN);
     text(6, 30, "DIAL", 1, GREY);
     text(6, 40, mk_dial_name(mk_dial), 3, YELLOW);
